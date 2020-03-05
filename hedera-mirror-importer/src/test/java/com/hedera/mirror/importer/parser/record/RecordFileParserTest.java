@@ -31,6 +31,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
+import java.util.Optional;
 import javax.annotation.Resource;
 import org.apache.commons.io.FileUtils;
 import org.assertj.core.api.Assertions;
@@ -106,8 +107,8 @@ public class RecordFileParserTest extends IntegrationTest {
                 .hasSize(NUM_TXNS_FILE_1 + NUM_TXNS_FILE_2)
                 .extracting(Transaction::getType)
                 .containsOnlyElementsOf(Sets.newHashSet(11, 12, 14));
-        assertEquals(1, recordFileRepository.findByName(file1.toString()).size());
-        assertEquals(1, recordFileRepository.findByName(file2.toString()).size());
+        assertTrue(recordFileRepository.findById(file1.toString()).isPresent());
+        assertTrue(recordFileRepository.findById(file2.toString()).isPresent());
     }
 
     @Test
@@ -187,7 +188,7 @@ public class RecordFileParserTest extends IntegrationTest {
         boolean success = recordFileParser.loadRecordFile(fileName, new FileInputStream(file1), "", "");
         assertTrue(success);
         Assertions.assertThat(transactionRepository.findAll()).hasSize(NUM_TXNS_FILE_1);
-        assertEquals(1, recordFileRepository.findByName(fileName).size());
+        assertTrue(recordFileRepository.findById(fileName).isPresent());
 
         // when: load same file again
         success = recordFileParser.loadRecordFile(fileName, new FileInputStream(file1), "", "");
@@ -195,7 +196,7 @@ public class RecordFileParserTest extends IntegrationTest {
         // expect
         assertTrue(success);
         Assertions.assertThat(transactionRepository.findAll()).hasSize(NUM_TXNS_FILE_1);
-        assertEquals(1, recordFileRepository.findByName(fileName).size());
+        assertTrue(recordFileRepository.findById(fileName).isPresent());
 
         recordFileParser.closeConnection();
     }
@@ -215,11 +216,10 @@ public class RecordFileParserTest extends IntegrationTest {
 
         // expect
         assertTrue(success);
-        List<RecordFile> recordFileList = recordFileRepository.findByName(fileName);
-        assertEquals(1, recordFileList.size());
-        RecordFile recordFile = recordFileList.get(0);
-        assertEquals(expectedPrevFileHash, recordFile.getPreviousHash());
-        assertEquals("456", recordFile.getFileHash());
+        Optional<RecordFile> recordFile = recordFileRepository.findById(fileName);
+        assertTrue(recordFile.isPresent());
+        assertEquals(expectedPrevFileHash, recordFile.get().getPreviousHash());
+        assertEquals("456", recordFile.get().getFileHash());
 
         recordFileParser.closeConnection();
     }

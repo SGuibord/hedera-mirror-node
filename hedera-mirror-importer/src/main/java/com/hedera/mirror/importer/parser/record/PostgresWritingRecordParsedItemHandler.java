@@ -58,9 +58,9 @@ public class PostgresWritingRecordParsedItemHandler implements RecordParsedItemH
             sqlInsertTransaction = connection.prepareStatement("INSERT INTO t_transactions"
                     + " (fk_node_acc_id, memo, valid_start_ns, type, fk_payer_acc_id"
                     + ", result, consensus_ns, fk_cud_entity_id, charged_tx_fee"
-                    + ", initial_balance, fk_rec_file_id, valid_duration_seconds, max_fee"
+                    + ", initial_balance, valid_duration_seconds, max_fee"
                     + ", transaction_hash, transaction_bytes)"
-                    + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                    + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
             sqlInsertTransferList = connection.prepareStatement("INSERT INTO t_cryptotransferlists"
                     + " (consensus_timestamp, amount, realm_num, entity_num)"
@@ -119,8 +119,7 @@ public class PostgresWritingRecordParsedItemHandler implements RecordParsedItemH
             int[] liveHashes = sqlInsertLiveHashes.executeBatch();
             int[] topicMessages = sqlInsertTopicMessage.executeBatch();
             log.info("Inserted {} transactions, {} transfer lists, {} files, {} contracts, {} claims, {} topic " +
-                            "messages, " +
-                            "{} non-fee transfers",
+                            "messages, {} non-fee transfers",
                     transactions.length, transferLists.length, fileData.length, contractResult.length,
                     liveHashes.length, topicMessages.length, nonFeeTransfers.length);
         } catch (SQLException e) {
@@ -139,7 +138,6 @@ public class PostgresWritingRecordParsedItemHandler implements RecordParsedItemH
             } else {
                 sqlInsertTransaction.setObject(F_TRANSACTION.CUD_ENTITY_ID.ordinal(), null);
             }
-            sqlInsertTransaction.setLong(F_TRANSACTION.FK_REC_FILE_ID.ordinal(), 0); // deprecated. set to 0 until removed.
             sqlInsertTransaction.setLong(F_TRANSACTION.FK_NODE_ACCOUNT_ID.ordinal(), transaction.getNodeAccountId());
             sqlInsertTransaction.setBytes(F_TRANSACTION.MEMO.ordinal(), transaction.getMemo());
             sqlInsertTransaction.setLong(F_TRANSACTION.VALID_START_NS.ordinal(), transaction.getValidStartNs());
@@ -258,7 +256,7 @@ public class PostgresWritingRecordParsedItemHandler implements RecordParsedItemH
     enum F_TRANSACTION {
         ZERO // column indices start at 1, this creates the necessary offset
         , FK_NODE_ACCOUNT_ID, MEMO, VALID_START_NS, TYPE, FK_PAYER_ACCOUNT_ID, RESULT, CONSENSUS_NS,
-        CUD_ENTITY_ID, CHARGED_TX_FEE, INITIAL_BALANCE, FK_REC_FILE_ID, VALID_DURATION_SECONDS, MAX_FEE,
+        CUD_ENTITY_ID, CHARGED_TX_FEE, INITIAL_BALANCE, VALID_DURATION_SECONDS, MAX_FEE,
         TRANSACTION_HASH, TRANSACTION_BYTES
     }
 

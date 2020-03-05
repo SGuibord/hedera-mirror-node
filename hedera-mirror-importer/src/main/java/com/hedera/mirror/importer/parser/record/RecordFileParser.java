@@ -21,10 +21,6 @@ package com.hedera.mirror.importer.parser.record;
  */
 
 import com.google.common.base.Stopwatch;
-
-import com.hedera.mirror.importer.exception.ParserSQLException;
-import com.hedera.mirror.importer.util.DatabaseUtilities;
-
 import com.hederahashgraph.api.proto.java.Transaction;
 import com.hederahashgraph.api.proto.java.TransactionBody.DataCase;
 import com.hederahashgraph.api.proto.java.TransactionRecord;
@@ -39,8 +35,9 @@ import java.io.InputStream;
 import java.nio.file.Path;
 import java.sql.CallableStatement;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.sql.Types;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
@@ -53,9 +50,12 @@ import org.apache.commons.codec.binary.Hex;
 import org.springframework.scheduling.annotation.Scheduled;
 
 import com.hedera.mirror.importer.domain.ApplicationStatusCode;
+import com.hedera.mirror.importer.domain.RecordFile;
+import com.hedera.mirror.importer.exception.ParserSQLException;
 import com.hedera.mirror.importer.parser.FileParser;
 import com.hedera.mirror.importer.parser.domain.RecordItem;
 import com.hedera.mirror.importer.repository.ApplicationStatusRepository;
+import com.hedera.mirror.importer.util.DatabaseUtilities;
 import com.hedera.mirror.importer.util.FileDelimiter;
 import com.hedera.mirror.importer.util.ShutdownHelper;
 import com.hedera.mirror.importer.util.Utility;
@@ -139,63 +139,49 @@ public class RecordFileParser implements FileParser {
     }
 
     /**
-     * @return 0 if row with given filename already exists, otherwise id of newly added row.
-     *         In case of failure, returns -1;
+     * Checks if given fileName exists in the database i.e. if the file has already been processed before.
+     *
+     * @return true if file processing should continue; false if the file should be skipped
+     * @throws SQLException
      */
-    public long initFile(String fileName) {
-        try {
-            long fileId;
-
-            try (CallableStatement fileCreate = connect.prepareCall("{? = call f_file_create( ? ) }")) {
-                fileCreate.registerOutParameter(1, Types.BIGINT);
-                fileCreate.setString(2, fileName);
-                fileCreate.execute();
-                fileId = fileCreate.getLong(1);
-            }
-
-            if (fileId == 0) {
+    public boolean initFile(String fileName) throws SQLException {
+        try (PreparedStatement ps = connect.prepareStatement(
+                "SELECT count(*) FROM t_record_files WHERE name = ?")) {
+            ps.setString(1, fileName);
+            ResultSet resultSet = ps.executeQuery();
+            resultSet.next();
+            long count = resultSet.getLong("count");
+            if (count != 0) {
                 log.trace("File {} already exists in the database.", fileName);
-            } else {
-                log.trace("Added file {} to the database.", fileName);
+                return false;
             }
-            return fileId;
-        } catch (SQLException e) {
-            log.error("Error saving file in database: {}",  fileName, e);
-            return -1L;
+            return true;
         }
     }
 
-    public void closeFileAndCommit(long fileId, String fileHash, String previousHash) throws SQLException {
-        try (CallableStatement fileClose = connect.prepareCall("{call f_file_complete( ?, ?, ? ) }")) {
-            postgresWriter.onFileComplete();
-
-            // update the file to processed
-
-            fileClose.setLong(1, fileId);
-
-            if (Utility.hashIsEmpty(fileHash)) {
-                fileClose.setObject(2, null);
-            } else {
-                fileClose.setString(2, fileHash);
-            }
-
-            if (Utility.hashIsEmpty(previousHash)) {
-                fileClose.setObject(3, null);
-            } else {
-                fileClose.setString(3, previousHash);
-            }
-
-            fileClose.execute();
-            // commit the changes to the database
-            connect.commit();
+    public void closeFileAndCommit(RecordFile recordFile) throws SQLException {
+        // TODO: would this logic be better in PostgresWritingRecordParsedItemHandler#onRecordFile(RecordFile)?
+        //   that's where rest of the db INSERT stuff lives too.
+        try (PreparedStatement sqlInsertRecordFiles = connect.prepareStatement("INSERT INTO t_record_files"
+                + " (name, load_start, load_end, file_hash, prev_hash)"
+                + " VALUES (?, ?, ?, ?, ?)")) {
+             sqlInsertRecordFiles.setString(1, recordFile.getName());
+            sqlInsertRecordFiles.setLong(2, recordFile.getLoadStart());
+            sqlInsertRecordFiles.setLong(3, recordFile.getLoadEnd());
+            sqlInsertRecordFiles.setString(4, recordFile.getFileHash());
+            sqlInsertRecordFiles.setString(5, recordFile.getPreviousHash());
+            sqlInsertRecordFiles.execute();
         }
+        postgresWriter.onFileComplete();
+        // commit the changes to the database
+        connect.commit();
     }
 
     void initConnection() {
         try {
             connect = DatabaseUtilities.getConnection();
             connect.setAutoCommit(false); // do not auto-commit
-            connect.setClientInfo("ApplicationName", this.getClass().getName());
+            connect.setClientInfo("ApplicationName", getClass().getName());
         } catch (SQLException e) {
             throw new ParserSQLException("Error setting up connection to database", e);
         }
@@ -230,11 +216,14 @@ public class RecordFileParser implements FileParser {
      * @throws Exception
      */
     public boolean loadRecordFile(String fileName, InputStream inputStream, String expectedPrevFileHash,
-                                   String thisFileHash) {
-        var fileId = initFile(fileName);
-        if (fileId == 0) {
-            return true; // skip this fle
-        } else if (fileId == -1) {
+                                  String thisFileHash) {
+        long startTime = Instant.now().getEpochSecond();
+        try {
+            if (!initFile(fileName)) {
+                return true; // skip file
+            }
+        } catch (SQLException e) {
+            log.error("Error saving file in database: {}", fileName, e);
             rollback();
             return false;
         }
@@ -338,7 +327,8 @@ public class RecordFileParser implements FileParser {
             }
 
             log.trace("Calculated file hash for the current file {}", thisFileHash);
-            closeFileAndCommit(fileId, thisFileHash, expectedPrevFileHash);
+            closeFileAndCommit(new RecordFile(fileName, startTime, Instant.now().getEpochSecond(),
+                    thisFileHash, expectedPrevFileHash));
 
             if (!Utility.hashIsEmpty(thisFileHash)) {
                 applicationStatusRepository
