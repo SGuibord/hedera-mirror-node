@@ -70,13 +70,15 @@ public class SharedPollingTopicListener implements TopicListener {
      */
     @EventListener(ApplicationReadyEvent.class)
     public void init() {
-        PollingContext context = new PollingContext();
-        Scheduler scheduler = Schedulers.newSingle("shared-poll", true);
-
         if (pollerDisposable != null) {
             pollerDisposable.dispose();
         }
 
+        if (!listenerProperties.isEnabled()) {
+            return;
+        }
+
+        PollingContext context = new PollingContext();
         poller = Flux.defer(() -> poll(context))
                 .repeatWhen(Repeat.times(Long.MAX_VALUE)
                         .fixedBackoff(listenerProperties.getPollingFrequency())

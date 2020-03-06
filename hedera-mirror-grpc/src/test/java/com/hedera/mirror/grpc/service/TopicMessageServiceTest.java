@@ -29,6 +29,7 @@ import java.util.Arrays;
 import java.util.Optional;
 import javax.annotation.Resource;
 import javax.validation.ConstraintViolationException;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentMatchers;
@@ -44,6 +45,7 @@ import com.hedera.mirror.grpc.domain.EntityType;
 import com.hedera.mirror.grpc.domain.TopicMessage;
 import com.hedera.mirror.grpc.domain.TopicMessageFilter;
 import com.hedera.mirror.grpc.exception.TopicNotFoundException;
+import com.hedera.mirror.grpc.listener.ListenerProperties;
 import com.hedera.mirror.grpc.listener.SharedPollingTopicListener;
 import com.hedera.mirror.grpc.listener.TopicListener;
 import com.hedera.mirror.grpc.repository.EntityRepository;
@@ -63,6 +65,9 @@ public class TopicMessageServiceTest extends GrpcIntegrationTest {
     private GrpcProperties grpcProperties;
 
     @Resource
+    private ListenerProperties listenerProperties;
+
+    @Resource
     private RetrieverProperties retrieverProperties;
 
     @Resource
@@ -70,8 +75,14 @@ public class TopicMessageServiceTest extends GrpcIntegrationTest {
 
     @BeforeEach
     void setup() {
+        listenerProperties.setEnabled(true);
         sharedPollingTopicListener.init(); // Clear the buffer between runs
         domainBuilder.entity().block();
+    }
+
+    @AfterEach
+    void after() {
+        listenerProperties.setEnabled(false);
     }
 
     @Test
@@ -526,7 +537,6 @@ public class TopicMessageServiceTest extends GrpcIntegrationTest {
                 ).stream());
 
         topicMessageService.subscribeTopic(filter)
-                .doOnError(e -> e.printStackTrace())
                 .map(TopicMessage::getSequenceNumber)
                 .as(StepVerifier::create)
                 .expectNext(1L, 2L, 3L, 4L)

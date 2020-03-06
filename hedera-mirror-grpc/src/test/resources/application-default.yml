@@ -15,6 +15,7 @@ hedera:
         username: mirror_node
       endTimeInterval: 100ms
       listener:
+        enabled: false
         pollingFrequency: 50ms
       retriever:
         pollingFrequency: 50ms
