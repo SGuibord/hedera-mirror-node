@@ -28,7 +28,7 @@ import org.apache.jmeter.protocol.java.sampler.AbstractJavaSamplerClient;
 import org.apache.jmeter.protocol.java.sampler.JavaSamplerContext;
 import org.apache.jmeter.samplers.SampleResult;
 
-import com.hedera.mirror.grpc.jmeter.ConnectionHandler;
+import com.hedera.mirror.grpc.jmeter.handler.ConnectionHandler;
 import com.hedera.mirror.grpc.jmeter.props.MessageGenerator;
 import com.hedera.mirror.grpc.jmeter.sampler.TopicMessageGeneratorSampler;
 
@@ -120,18 +120,5 @@ public class TopicMessageGeneratorClient extends AbstractJavaSamplerClient {
         }
 
         return result;
-    }
-
-    @Override
-    public void teardownTest(JavaSamplerContext context) {
-        try {
-            if (connectionHandler != null) {
-                connectionHandler.close();
-            }
-        } catch (Exception ex) {
-            log.error("Unable to close connection", ex);
-        }
-
-        super.teardownTest(context);
     }
 }

@@ -54,9 +54,10 @@ import org.junit.jupiter.params.provider.CsvSource;
 import com.hedera.mirror.importer.domain.CryptoTransfer;
 import com.hedera.mirror.importer.domain.Entities;
 import com.hedera.mirror.importer.domain.LiveHash;
+import com.hedera.mirror.importer.parser.domain.RecordItem;
 import com.hedera.mirror.importer.util.Utility;
 
-public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
+public class RecordItemParserCryptoTest extends AbstractRecordItemParserTest {
 
     //TODO: These transaction data items are not saved to the database
     //  cryptoCreateTransactionBody.getReceiveRecordThreshold()
@@ -91,8 +92,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         CryptoCreateTransactionBody cryptoCreateTransactionBody = transactionBody.getCryptoCreateAccount();
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -114,12 +114,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbNewAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertEquals(cryptoCreateTransactionBody.getAutoRenewPeriod().getSeconds(), dbNewAccountEntity
@@ -141,29 +138,6 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
     }
 
     @Test
-    void cryptoCreateBatch() throws Exception {
-
-        long testBatchSize = 10;
-        RecordFileLogger.setBatchSize(testBatchSize);
-
-        for (int i = 0; i < testBatchSize + 1; i++) {
-            Transaction transaction = cryptoCreateTransaction();
-            TransactionBody transactionBody = TransactionBody.parseFrom(transaction.getBodyBytes());
-            TransactionRecord record = transactionRecordSuccess(transactionBody);
-
-            RecordFileLogger.storeRecord(transaction, record);
-        }
-        RecordFileLogger.completeFile("", "");
-
-        long txCount = transactionRepository.count();
-
-        assertAll(
-                // row counts
-                () -> assertEquals(testBatchSize + 1, txCount)
-        );
-    }
-
-    @Test
     void cryptoCreateTransactionWithBody() throws Exception {
 
         Transaction transaction = createTransactionWithBody();
@@ -171,8 +145,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         CryptoCreateTransactionBody cryptoCreateTransactionBody = transactionBody.getCryptoCreateAccount();
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -199,12 +172,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbNewAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertEquals(cryptoCreateTransactionBody.getAutoRenewPeriod().getSeconds(), dbNewAccountEntity
@@ -240,8 +210,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionRecord record = transactionRecord(transactionBody,
                 ResponseCodeEnum.INSUFFICIENT_PAYER_BALANCE);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -263,12 +232,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbNewAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertEquals(cryptoCreateTransactionBody.getAutoRenewPeriod().getSeconds(), dbNewAccountEntity
@@ -307,8 +273,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 .setAmount(-initialBalance));
         TransactionRecord record = tempRecord.toBuilder().setTransferList(transferList).build();
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -330,12 +295,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbNewAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertEquals(cryptoCreateTransactionBody.getAutoRenewPeriod().getSeconds(), dbNewAccountEntity
@@ -363,15 +325,14 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody firstTransactionBody = TransactionBody.parseFrom(firstTransaction.getBodyBytes());
         TransactionRecord firstRecord = transactionRecordSuccess(firstTransactionBody);
 
-        RecordFileLogger.storeRecord(firstTransaction, firstRecord);
+        parseRecordItemAndCommit(new RecordItem(firstTransaction, firstRecord));
 
         Transaction transaction = cryptoCreateTransaction();
         TransactionBody transactionBody = TransactionBody.parseFrom(transaction.getBodyBytes());
         CryptoCreateTransactionBody cryptoCreateTransactionBody = transactionBody.getCryptoCreateAccount();
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -393,12 +354,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbNewAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertEquals(cryptoCreateTransactionBody.getAutoRenewPeriod().getSeconds(), dbNewAccountEntity
@@ -427,7 +385,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody createTransactionBody = TransactionBody.parseFrom(createTransaction.getBodyBytes());
         TransactionRecord createRecord = transactionRecordSuccess(createTransactionBody);
 
-        RecordFileLogger.storeRecord(createTransaction, createRecord);
+        parseRecordItemAndCommit(new RecordItem(createTransaction, createRecord));
 
         // now update
         Transaction transaction = cryptoUpdateTransaction();
@@ -435,8 +393,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         CryptoUpdateTransactionBody cryptoUpdateTransactionBody = transactionBody.getCryptoUpdateAccount();
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -458,12 +415,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertEquals(cryptoUpdateTransactionBody.getAutoRenewPeriod().getSeconds(), dbAccountEntity
@@ -499,8 +453,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         CryptoUpdateTransactionBody cryptoUpdateTransactionBody = transactionBody.getCryptoUpdateAccount();
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
     }
 
     @DisplayName("update account such that expiration timestamp overflows nanos_timestamp")
@@ -518,7 +471,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         var createTransactionBody = TransactionBody.parseFrom(createTransaction.getBodyBytes());
         var createRecord = transactionRecordSuccess(createTransactionBody);
 
-        RecordFileLogger.storeRecord(createTransaction, createRecord);
+        parseRecordItemAndCommit(new RecordItem(createTransaction, createRecord));
 
         // now update
         var updateTransaction = Transaction.newBuilder();
@@ -535,8 +488,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         updateTransaction.setBodyBytes(transactionBody.build().toByteString());
         var rec = transactionRecordSuccess(transactionBody.build());
 
-        RecordFileLogger.storeRecord(updateTransaction.build(), rec);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(updateTransaction.build(), rec));
 
         var dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(rec.getConsensusTimestamp())).get();
@@ -557,7 +509,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody createTransactionBody = TransactionBody.parseFrom(createTransaction.getBodyBytes());
         TransactionRecord createRecord = transactionRecordSuccess(createTransactionBody);
 
-        RecordFileLogger.storeRecord(createTransaction, createRecord);
+        parseRecordItemAndCommit(new RecordItem(createTransaction, createRecord));
 
         // now update
         Transaction transaction = cryptoUpdateTransaction();
@@ -565,8 +517,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionRecord record = transactionRecord(transactionBody,
                 ResponseCodeEnum.INSUFFICIENT_ACCOUNT_BALANCE);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbCreateTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(createRecord.getConsensusTimestamp())).get();
@@ -591,11 +542,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbAccountEntity)
-                // record transfer list
-                , () -> assertRecordTransfers(record)
                 // no changes to entity
                 , () -> assertEquals(dbAccountEntityBefore, dbAccountEntity)
         );
@@ -612,15 +561,14 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody createTransactionBody = TransactionBody.parseFrom(createTransaction.getBodyBytes());
         TransactionRecord createRecord = transactionRecordSuccess(createTransactionBody);
 
-        RecordFileLogger.storeRecord(createTransaction, createRecord);
+        parseRecordItemAndCommit(new RecordItem(createTransaction, createRecord));
 
         // now delete
         Transaction transaction = cryptoDeleteTransaction();
         TransactionBody transactionBody = TransactionBody.parseFrom(transaction.getBodyBytes());
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -642,12 +590,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertTrue(dbAccountEntity.isDeleted())
@@ -672,7 +617,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody createTransactionBody = TransactionBody.parseFrom(createTransaction.getBodyBytes());
         TransactionRecord createRecord = transactionRecordSuccess(createTransactionBody);
 
-        RecordFileLogger.storeRecord(createTransaction, createRecord);
+        parseRecordItemAndCommit(new RecordItem(createTransaction, createRecord));
 
         // now delete
         Transaction transaction = cryptoDeleteTransaction();
@@ -680,8 +625,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionRecord record = transactionRecord(transactionBody,
                 ResponseCodeEnum.INSUFFICIENT_ACCOUNT_BALANCE);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -703,12 +647,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertFalse(dbAccountEntity.isDeleted())
@@ -733,7 +674,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody createTransactionBody = TransactionBody.parseFrom(createTransaction.getBodyBytes());
         TransactionRecord createRecord = transactionRecordSuccess(createTransactionBody);
 
-        RecordFileLogger.storeRecord(createTransaction, createRecord);
+        parseRecordItemAndCommit(new RecordItem(createTransaction, createRecord));
 
         // now add claim
         Transaction transaction = cryptoAddClaimTransaction();
@@ -741,8 +682,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         CryptoAddClaimTransactionBody cryptoAddClaimTransactionBody = transactionBody.getCryptoAddClaim();
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -763,12 +703,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertAccount(cryptoAddClaimTransactionBody.getClaim().getAccountID(), dbAccountEntity)
@@ -789,7 +726,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody createTransactionBody = TransactionBody.parseFrom(createTransaction.getBodyBytes());
         TransactionRecord createRecord = transactionRecordSuccess(createTransactionBody);
 
-        RecordFileLogger.storeRecord(createTransaction, createRecord);
+        parseRecordItemAndCommit(new RecordItem(createTransaction, createRecord));
 
         // now add claim
         Transaction transaction = cryptoAddClaimTransaction();
@@ -797,8 +734,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         CryptoAddClaimTransactionBody cryptoAddClaimTransactionBody = transactionBody.getCryptoAddClaim();
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -818,12 +754,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertAccount(cryptoAddClaimTransactionBody.getClaim().getAccountID(), dbAccountEntity)
@@ -841,14 +774,14 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody createTransactionBody = TransactionBody.parseFrom(createTransaction.getBodyBytes());
         TransactionRecord createRecord = transactionRecordSuccess(createTransactionBody);
 
-        RecordFileLogger.storeRecord(createTransaction, createRecord);
+        parseRecordItemAndCommit(new RecordItem(createTransaction, createRecord));
 
         // add a claim
         Transaction transactionAddClaim = cryptoAddClaimTransaction();
         TransactionBody transactionBodyAddClaim = TransactionBody.parseFrom(transactionAddClaim.getBodyBytes());
         TransactionRecord recordAddClaim = transactionRecordSuccess(transactionBodyAddClaim);
 
-        RecordFileLogger.storeRecord(transactionAddClaim, recordAddClaim);
+        parseRecordItemAndCommit(new RecordItem(transactionAddClaim, recordAddClaim));
 
         // now delete the claim
         Transaction transaction = cryptoDeleteClaimTransaction();
@@ -856,8 +789,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         CryptoDeleteClaimTransactionBody deleteClaimTransactionBody = transactionBody.getCryptoDeleteClaim();
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -876,12 +808,9 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
                 // receipt
                 , () -> assertAccount(record.getReceipt().getAccountID(), dbAccountEntity)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
 
                 // transaction body inputs
                 , () -> assertAccount(deleteClaimTransactionBody.getAccountIDToDeleteFrom(), dbAccountEntity)
@@ -900,9 +829,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody transactionBody = TransactionBody.parseFrom(transaction.getBodyBytes());
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -920,10 +847,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
-
-                // record transfer list
-                , () -> assertRecordTransfers(record)
+                , () -> assertRecord(record)
         );
 
         // Crypto transfer list
@@ -938,9 +862,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionBody transactionBody = TransactionBody.parseFrom(transaction.getBodyBytes());
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -958,7 +880,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
                 // transaction
                 , () -> assertTransaction(transactionBody, dbTransaction)
                 // record inputs
-                , () -> assertRecord(record, dbTransaction)
+                , () -> assertRecord(record)
         );
 
         // Crypto transfer list
@@ -984,8 +906,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         CryptoCreateTransactionBody cryptoCreateTransactionBody = transactionBody.getCryptoCreateAccount();
         TransactionRecord record = transactionRecord(transactionBody, unknownResult);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         org.assertj.core.api.Assertions.assertThat(transactionRepository.findAll())
                 .hasSize(1)
@@ -1013,8 +934,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
 
         TransactionRecord record = transactionRecordSuccess(transactionBody);
 
-        RecordFileLogger.storeRecord(transaction, record);
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record));
 
         org.assertj.core.api.Assertions.assertThat(transactionRepository.findAll())
                 .hasSize(1)
@@ -1279,9 +1199,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionRecord record = transactionRecordSuccess(transactionBody);
         byte[] rawBytes = transaction.getBodyBytes().toByteArray();
 
-        RecordFileLogger.storeRecord(transaction, record, rawBytes);
-
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record, rawBytes, null));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -1298,9 +1216,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionRecord record = transactionRecordSuccess(transactionBody);
         byte[] rawBytes = transaction.getBodyBytes().toByteArray();
 
-        RecordFileLogger.storeRecord(transaction, record, rawBytes);
-
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record, rawBytes, null));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();
@@ -1317,9 +1233,7 @@ public class RecordFileLoggerCryptoTest extends AbstractRecordFileLoggerTest {
         TransactionRecord record = transactionRecordSuccess(transactionBody);
         byte[] rawBytes = transaction.getBodyBytes().toByteArray();
 
-        RecordFileLogger.storeRecord(transaction, record, rawBytes);
-
-        RecordFileLogger.completeFile("", "");
+        parseRecordItemAndCommit(new RecordItem(transaction, record, rawBytes, null));
 
         com.hedera.mirror.importer.domain.Transaction dbTransaction = transactionRepository
                 .findById(Utility.timeStampInNanos(record.getConsensusTimestamp())).get();

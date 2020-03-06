@@ -20,6 +20,7 @@ package com.hedera.mirror.importer.parser.record;
  * ‍
  */
 
+import com.google.protobuf.InvalidProtocolBufferException;
 import com.hederahashgraph.api.proto.java.AccountID;
 import com.hederahashgraph.api.proto.java.ConsensusSubmitMessageTransactionBody;
 import com.hederahashgraph.api.proto.java.ContractCallTransactionBody;
@@ -44,18 +45,29 @@ import com.hederahashgraph.api.proto.java.TransferList;
 import java.io.IOException;
 import java.sql.CallableStatement;
 import java.sql.Connection;
-import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.util.Set;
 import java.util.function.Predicate;
 import javax.inject.Named;
+import lombok.Getter;
 import lombok.extern.log4j.Log4j2;
 
 import com.hedera.mirror.importer.addressbook.NetworkAddressBook;
+import com.hedera.mirror.importer.domain.ContractResult;
+import com.hedera.mirror.importer.domain.CryptoTransfer;
 import com.hedera.mirror.importer.domain.Entities;
+import com.hedera.mirror.importer.domain.EntityId;
 import com.hedera.mirror.importer.domain.EntityType;
+import com.hedera.mirror.importer.domain.FileData;
+import com.hedera.mirror.importer.domain.LiveHash;
+import com.hedera.mirror.importer.domain.NonFeeTransfer;
+import com.hedera.mirror.importer.domain.TopicMessage;
+import com.hedera.mirror.importer.exception.ImporterException;
+import com.hedera.mirror.importer.exception.ParserException;
+import com.hedera.mirror.importer.exception.ParserSQLException;
 import com.hedera.mirror.importer.parser.CommonParserProperties;
+import com.hedera.mirror.importer.parser.domain.RecordItem;
 import com.hedera.mirror.importer.repository.EntityRepository;
 import com.hedera.mirror.importer.repository.EntityTypeRepository;
 import com.hedera.mirror.importer.util.DatabaseUtilities;
@@ -63,46 +75,34 @@ import com.hedera.mirror.importer.util.Utility;
 
 @Log4j2
 @Named
-public class RecordFileLogger {
-    public static Connection connect = null;
-    private static RecordParserProperties parserProperties;
-    private static NetworkAddressBook networkAddressBook;
-    private static EntityRepository entityRepository;
-    private static EntityTypeRepository entityTypeRepository;
-    private static Predicate<com.hedera.mirror.importer.domain.Transaction> transactionFilter;
+public class RecordItemParser implements RecordItemListener {
+    private final RecordParserProperties parserProperties;
+    private final NetworkAddressBook networkAddressBook;
+    private final EntityRepository entityRepository;
+    private final EntityTypeRepository entityTypeRepository;
+    private final NonFeeTransferExtractionStrategy nonFeeTransfersExtractor;
+    private final Predicate<com.hedera.mirror.importer.domain.Transaction> transactionFilter;
+    private final PostgresWritingRecordParsedItemHandler postgresWriter;
 
-    private static long fileId = 0;
-    private static long BATCH_SIZE = 100;
-    private static long batch_count = 0;
+    public Connection connect = null;
+    @Getter
+    private long fileId = 0;
 
-    private static PreparedStatement sqlInsertTransaction;
-    private static PreparedStatement sqlInsertTransferList;
-    private static PreparedStatement sqlInsertFileData;
-    private static PreparedStatement sqlInsertContractCall;
-    private static PreparedStatement sqlInsertClaimData;
-    private static PreparedStatement sqlInsertTopicMessage;
-
-    public RecordFileLogger(CommonParserProperties commonParserProperties, RecordParserProperties parserProperties,
-                            NetworkAddressBook networkAddressBook,
-                            EntityRepository entityRepository, EntityTypeRepository entityTypeRepository) {
-        RecordFileLogger.parserProperties = parserProperties;
-        RecordFileLogger.networkAddressBook = networkAddressBook;
-        RecordFileLogger.entityRepository = entityRepository;
-        RecordFileLogger.entityTypeRepository = entityTypeRepository;
+    public RecordItemParser(CommonParserProperties commonParserProperties, RecordParserProperties parserProperties,
+                            NetworkAddressBook networkAddressBook, EntityRepository entityRepository,
+                            EntityTypeRepository entityTypeRepository,
+                            NonFeeTransferExtractionStrategy nonFeeTransfersExtractor,
+                            PostgresWritingRecordParsedItemHandler postgresWriter) {
+        this.parserProperties = parserProperties;
+        this.networkAddressBook = networkAddressBook;
+        this.entityRepository = entityRepository;
+        this.entityTypeRepository = entityTypeRepository;
+        this.nonFeeTransfersExtractor = nonFeeTransfersExtractor;
+        this.postgresWriter = postgresWriter;
         transactionFilter = commonParserProperties.getFilter();
     }
 
-    static long getFileId() {
-        return fileId;
-    }
-
-    static void setBatchSize(long batchSize) {
-        BATCH_SIZE = batchSize;
-    }
-
-    public static boolean start() {
-        batch_count = 0;
-
+    public boolean start() {
         connect = DatabaseUtilities.openDatabase(connect);
 
         if (connect == null) {
@@ -116,51 +116,18 @@ public class RecordFileLogger {
             log.error("Unable to set connection to not auto commit", e);
             return false;
         }
-
         try {
-            sqlInsertTransaction = connect.prepareStatement("INSERT INTO t_transactions"
-                    + " (fk_node_acc_id, memo, valid_start_ns, type, fk_payer_acc_id"
-                    + ", result, consensus_ns, fk_cud_entity_id, charged_tx_fee"
-                    + ", initial_balance, fk_rec_file_id, valid_duration_seconds, max_fee"
-                    + ", transaction_hash, transaction_bytes)"
-                    + " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-
-            sqlInsertTransferList = connect.prepareStatement("INSERT INTO t_cryptotransferlists"
-                    + " (consensus_timestamp, amount, realm_num, entity_num)"
-                    + " VALUES (?, ?, ?, ?)");
-
-            sqlInsertFileData = connect.prepareStatement("INSERT INTO t_file_data"
-                    + " (consensus_timestamp, file_data)"
-                    + " VALUES (?, ?)");
-
-            sqlInsertContractCall = connect.prepareStatement("INSERT INTO t_contract_result"
-                    + " (consensus_timestamp, function_params, gas_supplied, call_result, gas_used)"
-                    + " VALUES (?, ?, ?, ?, ?)");
-
-            sqlInsertClaimData = connect.prepareStatement("INSERT INTO t_livehashes"
-                    + " (consensus_timestamp, livehash)"
-                    + " VALUES (?, ?)");
-
-            sqlInsertTopicMessage = connect.prepareStatement("insert into topic_message"
-                    + " (consensus_timestamp, realm_num, topic_num, message, running_hash, sequence_number)"
-                    + " values (?, ?, ?, ?, ?, ?)");
-        } catch (SQLException e) {
+            postgresWriter.initSqlStatements(connect);
+        } catch (ParserSQLException e) {
             log.error("Unable to prepare SQL statements", e);
             return false;
         }
-
         return true;
     }
 
-    public static boolean finish() {
+    public boolean finish() {
         try {
-            sqlInsertFileData.close();
-            sqlInsertTransferList.close();
-            sqlInsertTransaction.close();
-            sqlInsertContractCall.close();
-            sqlInsertClaimData.close();
-            sqlInsertTopicMessage.close();
-
+            postgresWriter.finish();
             connect = DatabaseUtilities.closeDatabase(connect);
             return false;
         } catch (SQLException e) {
@@ -169,7 +136,7 @@ public class RecordFileLogger {
         return true;
     }
 
-    public static INIT_RESULT initFile(String fileName) {
+    public INIT_RESULT initFile(String fileName) {
         try {
             fileId = 0;
 
@@ -193,10 +160,9 @@ public class RecordFileLogger {
         return INIT_RESULT.FAIL;
     }
 
-    public static void completeFile(String fileHash, String previousHash) throws SQLException {
+    public void completeFile(String fileHash, String previousHash) throws SQLException {
         try (CallableStatement fileClose = connect.prepareCall("{call f_file_complete( ?, ?, ? ) }")) {
-            // execute any remaining batches
-            executeBatches();
+            postgresWriter.onFileComplete();
 
             // update the file to processed
 
@@ -220,7 +186,7 @@ public class RecordFileLogger {
         }
     }
 
-    public static void rollback() {
+    public void rollback() {
         try {
             connect.rollback();
         } catch (SQLException e) {
@@ -232,23 +198,28 @@ public class RecordFileLogger {
         return ResponseCodeEnum.SUCCESS == transactionRecord.getReceipt().getStatus();
     }
 
-    public static void storeRecord(Transaction transaction, TransactionRecord txRecord) throws Exception {
-        storeRecord(transaction, txRecord, null);
-    }
+    @Override
+    public void onItem(RecordItem recordItem) throws ImporterException {
+        Transaction transaction = recordItem.getTransaction();
+        TransactionRecord txRecord = recordItem.getRecord();
 
-    public static void storeRecord(Transaction transaction, TransactionRecord txRecord, byte[] rawBytes) throws Exception {
         TransactionBody body;
-
         if (transaction.hasBody()) {
             body = transaction.getBody();
         } else {
-            body = TransactionBody.parseFrom(transaction.getBodyBytes());
+            try {
+                body = TransactionBody.parseFrom(transaction.getBodyBytes());
+            } catch (InvalidProtocolBufferException e) {
+                throw new ParserException("Error parsing transaction from body bytes", e);
+            }
         }
 
         log.trace("Storing transaction body: {}", () -> Utility.printProtoMessage(body));
         long initialBalance = 0;
-        Entities entity = null;
-        Entities proxyEntity = null;
+
+        Entities entity = null; // Entity used when t_entities row must be updated.
+        EntityId entityId = null; // Entity ID simply used for reference purposes (in the transaction object)
+        EntityId proxyEntityId = null;
 
         /**
          * If the transaction wasn't successful don't update the entity.
@@ -261,13 +232,13 @@ public class RecordFileLogger {
 
         if (body.hasContractCall()) {
             if (body.getContractCall().hasContractID()) {
-                entity = getEntity(body.getContractCall().getContractID());
+                entityId = getEntityId(body.getContractCall().getContractID());
             }
         } else if (body.hasContractCreateInstance()) {
             if (txRecord.getReceipt().hasContractID()) { // implies SUCCESS
                 ContractCreateTransactionBody txMessage = body.getContractCreateInstance();
                 entity = getEntity(txRecord.getReceipt().getContractID());
-                proxyEntity = getEntity(txMessage.getProxyAccountID());
+                proxyEntityId = getEntityId(txMessage.getProxyAccountID());
 
                 if (txMessage.hasAutoRenewPeriod()) {
                     entity.setAutoRenewPeriod(txMessage.getAutoRenewPeriod().getSeconds());
@@ -296,7 +267,7 @@ public class RecordFileLogger {
             entity = getEntity(txMessage.getContractID());
 
             if (doUpdateEntity) {
-                proxyEntity = getEntity(txMessage.getProxyAccountID());
+                proxyEntityId = getEntityId(txMessage.getProxyAccountID());
 
                 if (txMessage.hasExpirationTime()) {
                     entity.setExpiryTimeNs(Utility.timestampInNanosMax(txMessage.getExpirationTime()));
@@ -318,13 +289,13 @@ public class RecordFileLogger {
         } else if (body.hasCryptoAddClaim()) {
             if (body.getCryptoAddClaim().hasClaim()) {
                 if (body.getCryptoAddClaim().getClaim().hasAccountID()) {
-                    entity = getEntity(body.getCryptoAddClaim().getClaim().getAccountID());
+                    entityId = getEntityId(body.getCryptoAddClaim().getClaim().getAccountID());
                 }
             }
         } else if (body.hasCryptoCreateAccount()) {
             if (txRecord.getReceipt().hasAccountID()) { // Implies SUCCESS
                 CryptoCreateTransactionBody txMessage = body.getCryptoCreateAccount();
-                proxyEntity = getEntity(txMessage.getProxyAccountID());
+                proxyEntityId = getEntityId(txMessage.getProxyAccountID());
                 entity = getEntity(txRecord.getReceipt().getAccountID());
 
                 if (txMessage.hasAutoRenewPeriod()) {
@@ -346,13 +317,13 @@ public class RecordFileLogger {
             }
         } else if (body.hasCryptoDeleteClaim()) {
             if (body.getCryptoDeleteClaim().hasAccountIDToDeleteFrom()) {
-                entity = getEntity(body.getCryptoDeleteClaim().getAccountIDToDeleteFrom());
+                entityId = getEntityId(body.getCryptoDeleteClaim().getAccountIDToDeleteFrom());
             }
         } else if (body.hasCryptoUpdateAccount()) {
             CryptoUpdateTransactionBody txMessage = body.getCryptoUpdateAccount();
             entity = getEntity(txMessage.getAccountIDToUpdate());
             if (doUpdateEntity) {
-                proxyEntity = getEntity(txMessage.getProxyAccountID());
+                proxyEntityId = getEntityId(txMessage.getProxyAccountID());
 
                 if (txMessage.hasExpirationTime()) {
                     entity.setExpiryTimeNs(Utility.timestampInNanosMax(txMessage.getExpirationTime()));
@@ -381,7 +352,7 @@ public class RecordFileLogger {
             }
         } else if (body.hasFileAppend()) {
             if (body.getFileAppend().hasFileID()) {
-                entity = getEntity(body.getFileAppend().getFileID());
+                entityId = getEntityId(body.getFileAppend().getFileID());
             }
         } else if (body.hasFileDelete()) {
             if (body.getFileDelete().hasFileID()) {
@@ -434,7 +405,7 @@ public class RecordFileLogger {
         } else if (body.hasConsensusDeleteTopic()) {
             entity = storeConsensusDeleteTopic(body, txRecord);
         } else if (body.hasConsensusSubmitMessage()) {
-            entity = storeConsensusSubmitMessage(body, txRecord);
+            entityId = storeConsensusSubmitMessage(body, txRecord);
         }
 
         TransactionID transactionID = body.getTransactionID();
@@ -447,14 +418,23 @@ public class RecordFileLogger {
         com.hedera.mirror.importer.domain.Transaction tx = new com.hedera.mirror.importer.domain.Transaction();
         tx.setChargedTxFee(txRecord.getTransactionFee());
         tx.setConsensusNs(consensusNs);
-        tx.setEntity(entity);
+        if (entityId != null) {
+            var tempEntity = new Entities();
+            tempEntity.setId(entityId.getId());
+            tempEntity.setEntityShard(entityId.getEntityShard());
+            tempEntity.setEntityRealm(entityId.getEntityRealm());
+            tempEntity.setEntityNum(entityId.getEntityNum());
+            tx.setEntity(tempEntity);
+        } else if (null != entity) {
+            tx.setEntity(entity);
+        }
         tx.setInitialBalance(initialBalance);
         tx.setMemo(body.getMemo().getBytes());
         tx.setMaxFee(body.getTransactionFee());
         tx.setRecordFileId(fileId);
         tx.setResult(txRecord.getReceipt().getStatusValue());
         tx.setType(getTransactionType(body));
-        tx.setTransactionBytes(parserProperties.isPersistTransactionBytes() ? rawBytes : null);
+        tx.setTransactionBytes(parserProperties.isPersistTransactionBytes() ? recordItem.getTransactionBytes() : null);
         tx.setTransactionHash(txRecord.getTransactionHash().toByteArray());
         tx.setValidDurationSeconds(validDurationSeconds);
         tx.setValidStartNs(validStartNs);
@@ -464,43 +444,25 @@ public class RecordFileLogger {
             return;
         }
 
-        proxyEntity = createEntity(proxyEntity);
-
         if (entity != null) {
-            if (proxyEntity != null) {
-                entity.setProxyAccountId(proxyEntity.getId());
+            if (proxyEntityId != null) {
+                entity.setProxyAccountId(proxyEntityId.getId());
             }
             entity.setAutoRenewAccount(createEntity(entity.getAutoRenewAccount()));
             entity = entityRepository.save(entity);
-            sqlInsertTransaction.setLong(F_TRANSACTION.CUD_ENTITY_ID.ordinal(), entity.getId());
-        } else {
-            sqlInsertTransaction.setObject(F_TRANSACTION.CUD_ENTITY_ID.ordinal(), null);
+        } else if (entityId != null) {
+            entity = new Entities();
+            entity.setId(entityId.getId());
         }
+        tx.setEntity(entity);
 
-        Entities payerEntity = createEntity(getEntity(payerAccountId));
-        Entities nodeEntity = createEntity(getEntity(body.getNodeAccountID()));
-        tx.setNodeAccountId(nodeEntity.getId());
-        tx.setPayerAccountId(payerEntity.getId());
-
-        // Temporary until we convert SQL statements to repository invocations
-        sqlInsertTransaction.setLong(F_TRANSACTION.FK_NODE_ACCOUNT_ID.ordinal(), tx.getNodeAccountId());
-        sqlInsertTransaction.setBytes(F_TRANSACTION.MEMO.ordinal(), tx.getMemo());
-        sqlInsertTransaction.setLong(F_TRANSACTION.VALID_START_NS.ordinal(), tx.getValidStartNs());
-        sqlInsertTransaction.setInt(F_TRANSACTION.TYPE.ordinal(), tx.getType());
-        sqlInsertTransaction.setLong(F_TRANSACTION.FK_REC_FILE_ID.ordinal(), tx.getRecordFileId());
-        sqlInsertTransaction.setLong(F_TRANSACTION.VALID_DURATION_SECONDS.ordinal(), tx.getValidDurationSeconds());
-        sqlInsertTransaction.setLong(F_TRANSACTION.FK_PAYER_ACCOUNT_ID.ordinal(), tx.getPayerAccountId());
-        sqlInsertTransaction.setLong(F_TRANSACTION.RESULT.ordinal(), tx.getResult());
-        sqlInsertTransaction.setLong(F_TRANSACTION.CONSENSUS_NS.ordinal(), tx.getConsensusNs());
-        sqlInsertTransaction.setLong(F_TRANSACTION.CHARGED_TX_FEE.ordinal(), tx.getChargedTxFee());
-        sqlInsertTransaction.setLong(F_TRANSACTION.MAX_FEE.ordinal(), tx.getMaxFee());
-        sqlInsertTransaction.setBytes(F_TRANSACTION.TRANSACTION_HASH.ordinal(), tx.getTransactionHash());
-        sqlInsertTransaction.setBytes(F_TRANSACTION.TRANSACTION_BYTES.ordinal(), tx.getTransactionBytes());
-        sqlInsertTransaction.setLong(F_TRANSACTION.INITIAL_BALANCE.ordinal(), tx.getInitialBalance());
-        sqlInsertTransaction.addBatch();
-        log.debug("Storing transaction: {}", tx);
+        EntityId payerEntityId = getEntityId(payerAccountId);
+        EntityId nodeEntityId = getEntityId(body.getNodeAccountID());
+        tx.setNodeAccountId(nodeEntityId.getId());
+        tx.setPayerAccountId(payerEntityId.getId());
 
         if ((txRecord.hasTransferList()) && parserProperties.isPersistCryptoTransferAmounts()) {
+            processNonFeeTransfers(consensusNs, payerAccountId, body, txRecord);
             if (body.hasCryptoCreateAccount() && isSuccessful(txRecord)) {
                 insertCryptoCreateTransferList(consensusNs, txRecord, body, txRecord.getReceipt()
                         .getAccountID(), payerAccountId);
@@ -510,7 +472,6 @@ public class RecordFileLogger {
         }
 
         // TransactionBody-specific handlers.
-        // If so-configured, each will update the SQL prepared statements via addBatch().
         if (body.hasContractCall()) {
             insertContractCall(consensusNs, body.getContractCall(), txRecord);
         } else if (body.hasContractCreateInstance()) {
@@ -524,18 +485,54 @@ public class RecordFileLogger {
             } else if (body.hasFileAppend()) {
                 insertFileAppend(consensusNs, body.getFileAppend());
             } else if (body.hasFileCreate()) {
-                insertFileCreate(consensusNs, body.getFileCreate(), txRecord);
+                insertFileData(consensusNs, body.getFileCreate().getContents().toByteArray(),
+                        txRecord.getReceipt().getFileID());
             } else if (body.hasFileUpdate()) {
                 insertFileUpdate(consensusNs, body.getFileUpdate());
             }
         }
 
-        if (batch_count == BATCH_SIZE - 1) {
-            // execute any remaining batches
-            executeBatches();
-            batch_count = 0;
-        } else {
-            batch_count += 1;
+        postgresWriter.onTransaction(tx);
+        log.debug("Storing transaction: {}", tx);
+    }
+
+    /**
+     * Should the given transaction/record generate non_fee_transfers based on what type the transaction is, it's
+     * status, and run-time configuration concerning which situations warrant storing.
+     *
+     * @param body
+     * @param transactionRecord
+     * @return
+     */
+    private boolean shouldStoreNonFeeTransfers(TransactionBody body, TransactionRecord transactionRecord) {
+        if (!body.hasCryptoCreateAccount() && !body.hasContractCreateInstance() && !body.hasCryptoTransfer() && !body
+                .hasContractCall()) {
+            return false;
+        }
+        return parserProperties.isPersistNonFeeTransfers();
+    }
+
+    /**
+     * Additionally store rows in the non_fee_transactions table if applicable. This will allow the rest-api to create
+     * an itemized set of transfers that reflects non-fees (explicit transfers), threshold records, node fee, and
+     * network+service fee (paid to treasury).
+     */
+    private void processNonFeeTransfers(long consensusTimestamp, AccountID payerAccountId,
+                                        TransactionBody body, TransactionRecord transactionRecord) {
+        if (!shouldStoreNonFeeTransfers(body, transactionRecord)) {
+            return;
+        }
+
+        for (var aa : nonFeeTransfersExtractor.extractNonFeeTransfers(payerAccountId, body, transactionRecord)) {
+            addNonFeeTransferInserts(consensusTimestamp, aa.getAccountID().getRealmNum(),
+                    aa.getAccountID().getAccountNum(), aa.getAmount());
+        }
+    }
+
+    private void addNonFeeTransferInserts(long consensusTimestamp, long realm, long accountNum, long amount) {
+        if (0 != amount) {
+            postgresWriter.onNonFeeTransfer(
+                    new NonFeeTransfer(consensusTimestamp, realm, accountNum, amount));
         }
     }
 
@@ -548,8 +545,8 @@ public class RecordFileLogger {
      * @throws SQLException
      * @throws IllegalArgumentException
      */
-    private static Entities storeConsensusCreateTopic(TransactionBody body,
-                                                      TransactionRecord transactionRecord) {
+    private Entities storeConsensusCreateTopic(TransactionBody body,
+                                               TransactionRecord transactionRecord) {
         if (!body.hasConsensusCreateTopic()) {
             throw new IllegalArgumentException("transaction is not a ConsensusCreateTopic");
         }
@@ -590,8 +587,8 @@ public class RecordFileLogger {
      * @throws SQLException
      * @throws IllegalArgumentException
      */
-    private static Entities storeConsensusUpdateTopic(TransactionBody body,
-                                                      TransactionRecord transactionRecord) {
+    private Entities storeConsensusUpdateTopic(TransactionBody body,
+                                               TransactionRecord transactionRecord) {
         if (!body.hasConsensusUpdateTopic()) {
             throw new IllegalArgumentException("transaction is not a ConsensusUpdateTopic");
         }
@@ -644,8 +641,8 @@ public class RecordFileLogger {
      * @throws SQLException
      * @throws IllegalArgumentException
      */
-    private static Entities storeConsensusDeleteTopic(TransactionBody body,
-                                                      TransactionRecord transactionRecord) {
+    private Entities storeConsensusDeleteTopic(TransactionBody body,
+                                               TransactionRecord transactionRecord) {
         if (!body.hasConsensusDeleteTopic()) {
             throw new IllegalArgumentException("transaction is not a ConsensusDeleteTopic");
         }
@@ -673,8 +670,8 @@ public class RecordFileLogger {
      * @throws SQLException
      * @throws IllegalArgumentException
      */
-    private static Entities storeConsensusSubmitMessage(TransactionBody body,
-                                                        TransactionRecord transactionRecord) {
+    private EntityId storeConsensusSubmitMessage(TransactionBody body,
+                                                 TransactionRecord transactionRecord) {
         if (!body.hasConsensusSubmitMessage()) {
             throw new IllegalArgumentException("transaction is not a ConsensusSubmitMessage");
         }
@@ -685,66 +682,52 @@ public class RecordFileLogger {
             return null;
         }
 
-        return getEntity(transactionBody.getTopicID());
+        return getEntityId(transactionBody.getTopicID());
     }
 
-    private static void insertConsensusTopicMessage(ConsensusSubmitMessageTransactionBody transactionBody,
-                                                    TransactionRecord transactionRecord) throws SQLException {
+    private void insertConsensusTopicMessage(ConsensusSubmitMessageTransactionBody transactionBody,
+                                             TransactionRecord transactionRecord) {
         var receipt = transactionRecord.getReceipt();
-        var ts = transactionRecord.getConsensusTimestamp();
         var topicId = transactionBody.getTopicID();
-        sqlInsertTopicMessage.setLong(1, Utility.timeStampInNanos(ts));
-        sqlInsertTopicMessage.setShort(2, (short) topicId.getRealmNum());
-        sqlInsertTopicMessage.setInt(3, (int) topicId.getTopicNum());
-        sqlInsertTopicMessage.setBytes(4, transactionBody.getMessage().toByteArray());
-        sqlInsertTopicMessage.setBytes(5, receipt.getTopicRunningHash().toByteArray());
-        sqlInsertTopicMessage.setLong(6, receipt.getTopicSequenceNumber());
-        sqlInsertTopicMessage.addBatch();
+        TopicMessage topicMessage = new TopicMessage(
+                Utility.timeStampInNanos(transactionRecord.getConsensusTimestamp()),
+                transactionBody.getMessage().toByteArray(), (int) topicId.getRealmNum(),
+                receipt.getTopicRunningHash().toByteArray(), receipt.getTopicSequenceNumber(),
+                (int) topicId.getTopicNum());
+        postgresWriter.onTopicMessage(topicMessage);
     }
 
-    private static void insertFileCreate(long consensusTimestamp, FileCreateTransactionBody transactionBody,
-                                         TransactionRecord transactionRecord) throws SQLException {
+    private void insertFileData(long consensusTimestamp, byte[] contents, FileID fileID) {
         if (parserProperties.isPersistFiles() ||
-                (parserProperties.isPersistSystemFiles() && transactionRecord.getReceipt().getFileID()
-                        .getFileNum() < 1000)) {
-            byte[] contents = transactionBody.getContents().toByteArray();
-            sqlInsertFileData.setLong(F_FILE_DATA.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
-            sqlInsertFileData.setBytes(F_FILE_DATA.FILE_DATA.ordinal(), contents);
-            sqlInsertFileData.addBatch();
+                (parserProperties.isPersistSystemFiles() && fileID.getFileNum() < 1000)) {
+            postgresWriter.onFileData(new FileData(consensusTimestamp, contents));
         }
     }
 
-    private static void insertFileAppend(long consensusTimestamp, FileAppendTransactionBody transactionBody)
-            throws SQLException, IOException {
-        if (parserProperties.isPersistFiles() ||
-                (parserProperties.isPersistSystemFiles() && transactionBody.getFileID().getFileNum() < 1000)) {
-            byte[] contents = transactionBody.getContents().toByteArray();
-            sqlInsertFileData.setLong(F_FILE_DATA.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
-            sqlInsertFileData.setBytes(F_FILE_DATA.FILE_DATA.ordinal(), contents);
-            sqlInsertFileData.addBatch();
-
-            // update the local address book
-            if (isFileAddressBook(transactionBody.getFileID())) {
-                // we have an address book update, refresh the local file
+    private void insertFileAppend(long consensusTimestamp, FileAppendTransactionBody transactionBody) {
+        byte[] contents = transactionBody.getContents().toByteArray();
+        insertFileData(consensusTimestamp, contents, transactionBody.getFileID());
+        // we have an address book update, refresh the local file
+        if (isFileAddressBook(transactionBody.getFileID())) {
+            try {
                 networkAddressBook.append(contents);
+            } catch (IOException e) {
+                throw new ParserException("Error appending to network address book", e);
             }
         }
     }
 
-    private static void insertCryptoAddClaim(long consensusTimestamp,
-                                             CryptoAddClaimTransactionBody transactionBody) throws SQLException {
+    private void insertCryptoAddClaim(long consensusTimestamp,
+                                      CryptoAddClaimTransactionBody transactionBody) {
         if (parserProperties.isPersistClaims()) {
             byte[] claim = transactionBody.getClaim().getHash().toByteArray();
-
-            sqlInsertClaimData.setLong(F_LIVEHASH_DATA.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
-            sqlInsertClaimData.setBytes(F_LIVEHASH_DATA.LIVEHASH.ordinal(), claim);
-            sqlInsertClaimData.addBatch();
+            postgresWriter.onLiveHash(new LiveHash(consensusTimestamp, claim));
         }
     }
 
-    private static void insertContractCall(long consensusTimestamp,
-                                           ContractCallTransactionBody transactionBody,
-                                           TransactionRecord transactionRecord) throws SQLException {
+    private void insertContractCall(long consensusTimestamp,
+                                    ContractCallTransactionBody transactionBody,
+                                    TransactionRecord transactionRecord) {
         if (parserProperties.isPersistContracts()) {
             byte[] functionParams = transactionBody.getFunctionParameters().toByteArray();
             long gasSupplied = transactionBody.getGas();
@@ -754,15 +737,13 @@ public class RecordFileLogger {
                 callResult = transactionRecord.getContractCallResult().toByteArray();
                 gasUsed = transactionRecord.getContractCallResult().getGasUsed();
             }
-
-            insertContractResults(sqlInsertContractCall, consensusTimestamp, functionParams, gasSupplied, callResult,
-                    gasUsed);
+            insertContractResults(consensusTimestamp, functionParams, gasSupplied, callResult, gasUsed);
         }
     }
 
-    private static void insertContractCreateInstance(long consensusTimestamp,
-                                                     ContractCreateTransactionBody transactionBody,
-                                                     TransactionRecord transactionRecord) throws SQLException {
+    private void insertContractCreateInstance(long consensusTimestamp,
+                                              ContractCreateTransactionBody transactionBody,
+                                              TransactionRecord transactionRecord) {
         if (parserProperties.isPersistContracts()) {
             byte[] functionParams = transactionBody.getConstructorParameters().toByteArray();
             long gasSupplied = transactionBody.getGas();
@@ -772,35 +753,25 @@ public class RecordFileLogger {
                 callResult = transactionRecord.getContractCreateResult().toByteArray();
                 gasUsed = transactionRecord.getContractCreateResult().getGasUsed();
             }
-
-            insertContractResults(sqlInsertContractCall, consensusTimestamp, functionParams, gasSupplied, callResult,
-                    gasUsed);
+            insertContractResults(consensusTimestamp, functionParams, gasSupplied, callResult, gasUsed);
         }
     }
 
-    private static void insertTransferList(long consensusTimestamp, TransferList transferList)
-            throws SQLException {
-
+    private void insertTransferList(long consensusTimestamp, TransferList transferList) {
         for (int i = 0; i < transferList.getAccountAmountsCount(); ++i) {
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
             var aa = transferList.getAccountAmounts(i);
             var accountId = aa.getAccountID();
             createEntity(getEntity(aa.getAccountID()));
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.AMOUNT.ordinal(), aa.getAmount());
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.REALM_NUM.ordinal(),
-                    accountId.getRealmNum());
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.ENTITY_NUM.ordinal(),
-                    accountId.getAccountNum());
-            sqlInsertTransferList.addBatch();
+            addCryptoTransferList(consensusTimestamp, accountId.getRealmNum(), accountId.getAccountNum(), aa
+                    .getAmount());
         }
     }
 
-    private static void insertCryptoCreateTransferList(long consensusTimestamp,
-                                                       TransactionRecord txRecord,
-                                                       TransactionBody body,
-                                                       AccountID createdAccountId,
-                                                       AccountID payerAccountId)
-            throws SQLException {
+    private void insertCryptoCreateTransferList(long consensusTimestamp,
+                                                TransactionRecord txRecord,
+                                                TransactionBody body,
+                                                AccountID createdAccountId,
+                                                AccountID payerAccountId) {
 
         long initialBalance = 0;
         long createdAccountNum = 0;
@@ -815,19 +786,11 @@ public class RecordFileLogger {
         }
         TransferList transferList = txRecord.getTransferList();
         for (int i = 0; i < transferList.getAccountAmountsCount(); ++i) {
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
             var aa = transferList.getAccountAmounts(i);
-            long amount = aa.getAmount();
             var accountId = aa.getAccountID();
             long accountNum = accountId.getAccountNum();
             createEntity(getEntity(accountId));
-
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.AMOUNT.ordinal(), amount);
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.REALM_NUM.ordinal(),
-                    accountId.getRealmNum());
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.ENTITY_NUM.ordinal(),
-                    accountNum);
-            sqlInsertTransferList.addBatch();
+            addCryptoTransferList(consensusTimestamp, accountId.getRealmNum(), accountNum, aa.getAmount());
 
             if (addInitialBalance && (initialBalance == aa.getAmount()) && (accountNum == createdAccountNum)) {
                 addInitialBalance = false;
@@ -836,46 +799,34 @@ public class RecordFileLogger {
 
         if (addInitialBalance) {
             createEntity(getEntity(payerAccountId));
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.AMOUNT.ordinal(), -initialBalance);
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.REALM_NUM.ordinal(),
-                    payerAccountId.getRealmNum());
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.ENTITY_NUM.ordinal(),
-                    payerAccountId.getAccountNum());
-
-            sqlInsertTransferList.addBatch();
+            addCryptoTransferList(consensusTimestamp, payerAccountId.getRealmNum(), payerAccountId
+                    .getAccountNum(), -initialBalance);
 
             createEntity(getEntity(createdAccountId));
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.REALM_NUM.ordinal(),
-                    createdAccountId.getRealmNum());
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.ENTITY_NUM.ordinal(),
-                    createdAccountNum);
-            sqlInsertTransferList.setLong(F_TRANSFERLIST.AMOUNT.ordinal(), initialBalance);
-
-            sqlInsertTransferList.addBatch();
+            addCryptoTransferList(consensusTimestamp, createdAccountId
+                    .getRealmNum(), createdAccountNum, initialBalance);
         }
+    }
+
+    private void addCryptoTransferList(long consensusTimestamp, long realmNum, long accountNum, long amount) {
+        postgresWriter.onCryptoTransferList(new CryptoTransfer(consensusTimestamp, amount, realmNum, accountNum));
     }
 
     private static boolean isFileAddressBook(FileID fileId) {
         return (fileId.getFileNum() == 102) && (fileId.getShardNum() == 0) && (fileId.getRealmNum() == 0);
     }
 
-    private static void insertFileUpdate(long consensusTimestamp, FileUpdateTransactionBody transactionBody)
-            throws SQLException, IOException {
+    private void insertFileUpdate(long consensusTimestamp, FileUpdateTransactionBody transactionBody) {
         FileID fileId = transactionBody.getFileID();
-        if (parserProperties.isPersistFiles() ||
-                (parserProperties.isPersistSystemFiles() && fileId.getFileNum() < 1000)) {
-            byte[] contents = transactionBody.getContents().toByteArray();
-            sqlInsertFileData.setLong(F_FILE_DATA.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
-            sqlInsertFileData.setBytes(F_FILE_DATA.FILE_DATA.ordinal(), contents);
-            sqlInsertFileData.addBatch();
-        }
-
-        // update the local address book
+        byte[] contents = transactionBody.getContents().toByteArray();
+        insertFileData(consensusTimestamp, contents, fileId);
+        // we have an address book update, refresh the local file
         if (isFileAddressBook(fileId)) {
-            // we have an address book update, refresh the local file
-            networkAddressBook.update(transactionBody.getContents().toByteArray());
+            try {
+                networkAddressBook.update(contents);
+            } catch (IOException e) {
+                throw new ParserException("Error appending to network address book", e);
+            }
         }
     }
 
@@ -904,47 +855,29 @@ public class RecordFileLogger {
         return dataCase.getNumber();
     }
 
-    public static void insertContractResults(PreparedStatement insert, long consensusTimestamp,
-                                             byte[] functionParams, long gasSupplied,
-                                             byte[] callResult, long gasUsed) throws SQLException {
-        insert.setLong(F_CONTRACT_CALL.CONSENSUS_TIMESTAMP.ordinal(), consensusTimestamp);
-        insert.setBytes(F_CONTRACT_CALL.FUNCTION_PARAMS.ordinal(), functionParams);
-        insert.setLong(F_CONTRACT_CALL.GAS_SUPPLIED.ordinal(), gasSupplied);
-        insert.setBytes(F_CONTRACT_CALL.CALL_RESULT.ordinal(), callResult);
-        insert.setLong(F_CONTRACT_CALL.GAS_USED.ordinal(), gasUsed);
-
-        insert.addBatch();
+    private void insertContractResults(
+            long consensusTimestamp, byte[] functionParams, long gasSupplied, byte[] callResult, long gasUsed) {
+        postgresWriter.onContractResult(
+                new ContractResult(consensusTimestamp, functionParams, gasSupplied, callResult, gasUsed));
     }
 
-    private static void executeBatches() throws SQLException {
-        int[] transactions = sqlInsertTransaction.executeBatch();
-        int[] transferLists = sqlInsertTransferList.executeBatch();
-        int[] fileData = sqlInsertFileData.executeBatch();
-        int[] contractCalls = sqlInsertContractCall.executeBatch();
-        int[] claimData = sqlInsertClaimData.executeBatch();
-        int[] topicMessages = sqlInsertTopicMessage.executeBatch();
-        log.info("Inserted {} transactions, {} transfer lists, {} files, {} contracts, {} claims, {} topic messages",
-                transactions.length, transferLists.length, fileData.length, contractCalls.length, claimData.length,
-                topicMessages.length);
-    }
-
-    public static Entities getEntity(AccountID accountID) {
+    public Entities getEntity(AccountID accountID) {
         return getEntity(accountID.getShardNum(), accountID.getRealmNum(), accountID.getAccountNum(), "account");
     }
 
-    public static Entities getEntity(ContractID cid) {
+    public Entities getEntity(ContractID cid) {
         return getEntity(cid.getShardNum(), cid.getRealmNum(), cid.getContractNum(), "contract");
     }
 
-    public static Entities getEntity(FileID fileId) {
+    public Entities getEntity(FileID fileId) {
         return getEntity(fileId.getShardNum(), fileId.getRealmNum(), fileId.getFileNum(), "file");
     }
 
-    public static Entities getEntity(TopicID topicId) {
+    public Entities getEntity(TopicID topicId) {
         return getEntity(topicId.getShardNum(), topicId.getRealmNum(), topicId.getTopicNum(), "topic");
     }
 
-    private static Entities getEntity(long shardNum, long realmNum, long entityNum, String type) {
+    private Entities getEntity(long shardNum, long realmNum, long entityNum, String type) {
         return entityRepository.findByPrimaryKey(shardNum, realmNum, entityNum).orElseGet(() -> {
             Entities entity = new Entities();
             entity.setEntityNum(entityNum);
@@ -955,39 +888,49 @@ public class RecordFileLogger {
         });
     }
 
-    private static Entities createEntity(Entities entity) {
+    public EntityId getEntityId(AccountID accountID) {
+        return getEntityId(accountID.getShardNum(), accountID.getRealmNum(), accountID.getAccountNum(), "account");
+    }
+
+    public EntityId getEntityId(ContractID cid) {
+        return getEntityId(cid.getShardNum(), cid.getRealmNum(), cid.getContractNum(), "contract");
+    }
+
+    public EntityId getEntityId(FileID fileId) {
+        return getEntityId(fileId.getShardNum(), fileId.getRealmNum(), fileId.getFileNum(), "file");
+    }
+
+    public EntityId getEntityId(TopicID topicId) {
+        return getEntityId(topicId.getShardNum(), topicId.getRealmNum(), topicId.getTopicNum(), "topic");
+    }
+
+    private EntityId getEntityId(long shardNum, long realmNum, long entityNum, String type) {
+        if (0 == entityNum) {
+            return null;
+        }
+        return entityRepository.findEntityIdByNativeIds(shardNum, realmNum, entityNum).orElseGet(() -> {
+            Entities entityId = new Entities();
+            entityId.setEntityShard(shardNum);
+            entityId.setEntityRealm(realmNum);
+            entityId.setEntityNum(entityNum);
+            entityId.setEntityTypeId(entityTypeRepository.findByName(type).map(EntityType::getId).get());
+            return entityRepository.saveAndCacheEntityId(entityId);
+        });
+    }
+
+    private Entities createEntity(Entities entity) {
         if (entity != null && entity.getId() == null) {
             log.debug("Creating entity: {}", () -> entity.getDisplayId());
-            return entityRepository.save(entity);
+            var result = entityRepository.save(entity);
+            var entityId = new EntityId(result.getId(), result.getEntityShard(), result.getEntityRealm(),
+                    result.getEntityNum(), result.getEntityTypeId());
+            entityRepository.cache(entityId);
+            return result;
         }
         return entity;
     }
 
     public enum INIT_RESULT {
         OK, FAIL, SKIP
-    }
-
-    enum F_TRANSACTION {
-        ZERO // column indices start at 1, this creates the necessary offset
-        , FK_NODE_ACCOUNT_ID, MEMO, VALID_START_NS, TYPE, FK_PAYER_ACCOUNT_ID, RESULT, CONSENSUS_NS,
-        CUD_ENTITY_ID, CHARGED_TX_FEE, INITIAL_BALANCE, FK_REC_FILE_ID, VALID_DURATION_SECONDS, MAX_FEE,
-        TRANSACTION_HASH, TRANSACTION_BYTES
-    }
-
-    enum F_TRANSFERLIST {
-        ZERO // column indices start at 1, this creates the necessary offset
-        , CONSENSUS_TIMESTAMP, AMOUNT, REALM_NUM, ENTITY_NUM
-    }
-
-    enum F_FILE_DATA {
-        ZERO, CONSENSUS_TIMESTAMP, FILE_DATA
-    }
-
-    enum F_CONTRACT_CALL {
-        ZERO, CONSENSUS_TIMESTAMP, FUNCTION_PARAMS, GAS_SUPPLIED, CALL_RESULT, GAS_USED
-    }
-
-    enum F_LIVEHASH_DATA {
-        ZERO, CONSENSUS_TIMESTAMP, LIVEHASH
     }
 }

@@ -21,6 +21,7 @@ package com.hedera.mirror.grpc.listener;
  */
 
 import java.time.Duration;
+import javax.validation.constraints.Min;
 import javax.validation.constraints.NotNull;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -31,13 +32,22 @@ import org.springframework.validation.annotation.Validated;
 @ConfigurationProperties("hedera.mirror.grpc.listener")
 public class ListenerProperties {
 
+    @NotNull
+    private Duration bufferInitial = Duration.ofSeconds(5);
+
+    @Min(1)
+    private int bufferSize = 50_000;
+
     private boolean enabled = true;
 
-    @NotNull
-    private Duration pollingFrequency = Duration.ofSeconds(2);
+    @Min(32)
+    private int maxPageSize = 10000;
 
     @NotNull
-    private ListenerType type = ListenerType.POLL;
+    private Duration pollingFrequency = Duration.ofSeconds(1);
+
+    @NotNull
+    private ListenerType type = ListenerType.SHARED_POLL;
 
     public enum ListenerType {
         POLL,

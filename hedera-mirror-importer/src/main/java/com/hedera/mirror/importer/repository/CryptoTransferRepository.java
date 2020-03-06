@@ -28,4 +28,6 @@ import com.hedera.mirror.importer.domain.CryptoTransfer;
 
 public interface CryptoTransferRepository extends CrudRepository<CryptoTransfer, Long> {
     Optional<CryptoTransfer> findByConsensusTimestampAndEntityNum(Long consensusTimestamp, Long entityNum);
+    Optional<CryptoTransfer> findByConsensusTimestampAndEntityNumAndAmount(Long consensusTimestamp, Long entityNum,
+                                                                           Long amount);
 }

@@ -30,5 +30,5 @@ import com.hedera.mirror.grpc.domain.TopicMessage;
 public interface TopicMessageRepository extends CrudRepository<TopicMessage, Long>, TopicMessageRepositoryCustom {
 
     @Query("from TopicMessage where consensusTimestamp > ?1 order by consensusTimestamp asc")
-    List<TopicMessage> findByConsensusTimestampGreaterThan(long consensusTimestamp, Pageable pageable);
+    List<TopicMessage> findLatest(long consensusTimestamp, Pageable pageable);
 }

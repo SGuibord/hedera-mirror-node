@@ -4,7 +4,7 @@ package com.hedera.mirror.grpc.retriever;
  * ‌
  * Hedera Mirror Node
  * ​
- * Copyright (C) 2019 Hedera Hashgraph, LLC
+ * Copyright (C) 2020 Hedera Hashgraph, LLC
  * ​
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,9 @@ package com.hedera.mirror.grpc.retriever;
  * ‍
  */
 
+import java.time.Duration;
+import javax.validation.constraints.Min;
+import javax.validation.constraints.NotNull;
 import lombok.Data;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.validation.annotation.Validated;
@@ -30,4 +33,16 @@ import org.springframework.validation.annotation.Validated;
 public class RetrieverProperties {
 
     private boolean enabled = true;
+
+    @Min(32)
+    private int maxPageSize = 200;
+
+    @NotNull
+    private Duration pollingFrequency = Duration.ofSeconds(2L);
+
+    @Min(1)
+    private int threadMultiplier = 4;
+
+    @NotNull
+    private Duration timeout = Duration.ofSeconds(30L);
 }

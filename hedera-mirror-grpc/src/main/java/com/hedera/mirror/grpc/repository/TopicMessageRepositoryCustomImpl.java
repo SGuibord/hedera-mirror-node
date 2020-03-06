@@ -31,7 +31,6 @@ import javax.persistence.criteria.Root;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
 
-import com.hedera.mirror.grpc.GrpcProperties;
 import com.hedera.mirror.grpc.converter.InstantToLongConverter;
 import com.hedera.mirror.grpc.domain.TopicMessage;
 import com.hedera.mirror.grpc.domain.TopicMessageFilter;
@@ -42,7 +41,6 @@ import com.hedera.mirror.grpc.domain.TopicMessageFilter;
 public class TopicMessageRepositoryCustomImpl implements TopicMessageRepositoryCustom {
 
     private final EntityManager entityManager;
-    private final GrpcProperties grpcProperties;
     private final InstantToLongConverter converter;
 
     @Override
@@ -62,13 +60,12 @@ public class TopicMessageRepositoryCustomImpl implements TopicMessageRepositoryC
                     .lessThan(root.get("consensusTimestamp"), converter.convert(filter.getEndTime())));
         }
 
-        int limit = filter.hasLimit() ? (int) filter.getLimit() : Integer.MAX_VALUE;
-        int pageSize = Math.min(limit, grpcProperties.getMaxPageSize());
-
         query = query.select(root).where(predicate).orderBy(cb.asc(root.get("consensusTimestamp")));
 
         TypedQuery<TopicMessage> typedQuery = entityManager.createQuery(query);
-        typedQuery.setMaxResults(pageSize);
+        if (filter.hasLimit()) {
+            typedQuery.setMaxResults((int) filter.getLimit());
+        }
         return typedQuery.getResultList().stream(); // getResultStream()'s cursor doesn't work with reactive streams
     }
 }

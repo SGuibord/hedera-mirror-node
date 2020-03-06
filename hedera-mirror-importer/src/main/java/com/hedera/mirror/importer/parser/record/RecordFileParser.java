@@ -30,7 +30,10 @@ import io.micrometer.core.instrument.Timer;
 import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.InputStream;
 import java.nio.file.Path;
+import java.sql.SQLException;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Arrays;
@@ -44,6 +47,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 
 import com.hedera.mirror.importer.domain.ApplicationStatusCode;
 import com.hedera.mirror.importer.parser.FileParser;
+import com.hedera.mirror.importer.parser.domain.RecordItem;
 import com.hedera.mirror.importer.repository.ApplicationStatusRepository;
 import com.hedera.mirror.importer.util.FileDelimiter;
 import com.hedera.mirror.importer.util.ShutdownHelper;
@@ -59,6 +63,7 @@ public class RecordFileParser implements FileParser {
     private final ApplicationStatusRepository applicationStatusRepository;
     private final RecordParserProperties parserProperties;
     private final MeterRegistry meterRegistry;
+    private final RecordItemParser recordItemParser;
 
     // Metrics
     private final Timer.Builder parseDurationMetric;
@@ -66,10 +71,12 @@ public class RecordFileParser implements FileParser {
     private final DistributionSummary.Builder transactionSizeMetric;
 
     public RecordFileParser(ApplicationStatusRepository applicationStatusRepository,
-                            RecordParserProperties parserProperties, MeterRegistry meterRegistry) {
+                            RecordParserProperties parserProperties, MeterRegistry meterRegistry,
+                            RecordItemParser recordItemParser) {
         this.applicationStatusRepository = applicationStatusRepository;
         this.parserProperties = parserProperties;
         this.meterRegistry = meterRegistry;
+        this.recordItemParser = recordItemParser;
 
         parseDurationMetric = Timer.builder("hedera.mirror.parse.duration")
                 .description("The duration in ms it took to parse the file and store it in the database");
@@ -120,156 +127,157 @@ public class RecordFileParser implements FileParser {
         return null;
     }
 
+    private RecordItemParser.INIT_RESULT initFile(String filename) {
+        return recordItemParser.initFile(filename);
+    }
+
+    private void closeFileAndCommit(String fileHash, String previousHash) throws SQLException {
+        recordItemParser.completeFile(fileHash, previousHash);
+    }
+
+    private void rollback() {
+        recordItemParser.rollback();
+    }
+
     /**
      * Given a service record name, read and parse and return as a list of service record pair
      *
-     * @param fileName         the name of record file to read
-     * @param previousFileHash the hash of the previous record file in the series
-     * @param thisFileHash     the hash of this file
+     * @param fileName             the name of record file to read
+     * @param inputStream          input stream of bytes in the record file
+     * @param expectedPrevFileHash the hash of the previous record file in the series
+     * @param thisFileHash         the hash of this file
      * @return return boolean indicating method success
      * @throws Exception
      */
-    private boolean loadRecordFile(String fileName, String previousFileHash, String thisFileHash) throws Exception {
-
-        File file = new File(fileName);
-        String newFileHash = "";
-
-        if (file.exists() == false) {
-            log.warn("File does not exist {}", fileName);
+    private boolean loadRecordFile(String fileName, InputStream inputStream, String expectedPrevFileHash,
+                                   String thisFileHash) {
+        var result = initFile(fileName);
+        if (result == RecordItemParser.INIT_RESULT.SKIP) {
+            return true; // skip this fle
+        } else if (result == RecordItemParser.INIT_RESULT.FAIL) {
+            rollback();
             return false;
         }
         long counter = 0;
-        byte[] readFileHash = new byte[48];
-        RecordFileLogger.INIT_RESULT initFileResult = RecordFileLogger.initFile(fileName);
         Stopwatch stopwatch = Stopwatch.createStarted();
         Integer recordFileVersion = 0;
         Boolean success = false;
 
-        if (initFileResult == RecordFileLogger.INIT_RESULT.OK) {
-            try (DataInputStream dis = new DataInputStream(new FileInputStream(file))) {
-                recordFileVersion = dis.readInt();
-                int version = dis.readInt();
+        try (DataInputStream dis = new DataInputStream(inputStream)) {
+            recordFileVersion = dis.readInt();
+            int version = dis.readInt();
 
-                log.info("Loading version {} record file: {}", recordFileVersion, file.getName());
+            log.info("Loading version {} record file: {}", recordFileVersion, fileName);
 
-                while (dis.available() != 0) {
+            while (dis.available() != 0) {
 
-                    try {
-                        byte typeDelimiter = dis.readByte();
+                try {
+                    byte typeDelimiter = dis.readByte();
 
-                        switch (typeDelimiter) {
-                            case FileDelimiter.RECORD_TYPE_PREV_HASH:
-                                dis.read(readFileHash);
+                    switch (typeDelimiter) {
+                        case FileDelimiter.RECORD_TYPE_PREV_HASH:
+                            byte[] readFileHash = new byte[48];
+                            dis.read(readFileHash);
 
-                                if (Utility.hashIsEmpty(previousFileHash)) {
-                                    log.error("Previous file hash not available");
-                                    previousFileHash = Hex.encodeHexString(readFileHash);
+                            if (Utility.hashIsEmpty(expectedPrevFileHash)) {
+                                log.error("Previous file hash not available");
+                                expectedPrevFileHash = Hex.encodeHexString(readFileHash);
+                            }
+
+                            String actualPrevFileHash = Hex.encodeHexString(readFileHash);
+                            log.trace("actual file hash = {}, expected file hash = {}", actualPrevFileHash,
+                                    expectedPrevFileHash);
+                            if (!actualPrevFileHash.contentEquals(expectedPrevFileHash)) {
+                                if (applicationStatusRepository
+                                        .findByStatusCode(ApplicationStatusCode.RECORD_HASH_MISMATCH_BYPASS_UNTIL_AFTER)
+                                        .compareTo(Utility.getFileName(fileName)) < 0) {
+                                    // last file for which mismatch is allowed is in the past
+                                    log.error("Hash mismatch for file {}. Actual = {}, Expected = {}", fileName,
+                                            expectedPrevFileHash, actualPrevFileHash);
+                                    rollback();
+                                    return false;
+                                }
+                            }
+                            break;
+                        case FileDelimiter.RECORD_TYPE_RECORD:
+                            counter++;
+
+                            int byteLength = dis.readInt();
+                            byte[] transactionRawBytes = new byte[byteLength];
+                            dis.readFully(transactionRawBytes);
+                            Transaction transaction = Transaction.parseFrom(transactionRawBytes);
+
+                            byteLength = dis.readInt();
+                            byte[] recordRawBytes = new byte[byteLength];
+                            dis.readFully(recordRawBytes);
+                            TransactionRecord txRecord = TransactionRecord.parseFrom(recordRawBytes);
+
+                            try {
+                                if (log.isTraceEnabled()) {
+                                    log.trace("Transaction = {}, Record = {}", Utility
+                                            .printProtoMessage(transaction), Utility.printProtoMessage(txRecord));
+                                } else {
+                                    log.debug("Storing transaction with consensus timestamp {}", () -> Utility
+                                            .printProtoMessage(txRecord.getConsensusTimestamp()));
                                 }
 
-                                newFileHash = Hex.encodeHexString(readFileHash);
+                                recordItemParser.onItem(
+                                        new RecordItem(transaction, txRecord, transactionRawBytes, recordRawBytes));
+                            } finally {
+                                // TODO: Refactor to not parse TransactionBody twice
+                                DataCase dc = Utility.getTransactionBody(transaction).getDataCase();
+                                String type = dc != null && dc != DataCase.DATA_NOT_SET ? dc.name() : "UNKNOWN";
+                                transactionSizeMetric.tag("type", type)
+                                        .register(meterRegistry)
+                                        .record(transactionRawBytes.length);
 
-                                log.trace("New file hash = {}, old hash = {}", newFileHash, previousFileHash);
+                                Instant consensusTimestamp = Utility
+                                        .convertToInstant(txRecord.getConsensusTimestamp());
+                                transactionLatencyMetric.tag("type", type)
+                                        .register(meterRegistry)
+                                        .record(Duration.between(consensusTimestamp, Instant.now()));
+                            }
+                            break;
+                        case FileDelimiter.RECORD_TYPE_SIGNATURE:
+                            int sigLength = dis.readInt();
+                            byte[] sigBytes = new byte[sigLength];
+                            dis.readFully(sigBytes);
+                            log.trace("File {} has signature {}", fileName, Hex.encodeHexString(sigBytes));
+                            break;
 
-                                if (!newFileHash.contentEquals(previousFileHash)) {
-
-                                    if (applicationStatusRepository
-                                            .findByStatusCode(ApplicationStatusCode.RECORD_HASH_MISMATCH_BYPASS_UNTIL_AFTER)
-                                            .compareTo(Utility.getFileName(fileName)) < 0) {
-                                        // last file for which mismatch is allowed is in the past
-                                        log.error("Hash mismatch for file {}. Previous = {}, Current = {}", fileName,
-                                                previousFileHash, newFileHash);
-                                        RecordFileLogger.rollback();
-                                        return false;
-                                    }
-                                }
-                                break;
-                            case FileDelimiter.RECORD_TYPE_RECORD:
-                                counter++;
-
-                                int byteLength = dis.readInt();
-                                byte[] rawBytes = new byte[byteLength];
-                                dis.readFully(rawBytes);
-                                Transaction transaction = Transaction.parseFrom(rawBytes);
-
-                                byteLength = dis.readInt();
-                                rawBytes = new byte[byteLength];
-                                dis.readFully(rawBytes);
-                                TransactionRecord txRecord = TransactionRecord.parseFrom(rawBytes);
-
-                                try {
-                                    if (log.isTraceEnabled()) {
-                                        log.trace("Transaction = {}, Record = {}", Utility
-                                                .printProtoMessage(transaction), Utility.printProtoMessage(txRecord));
-                                    } else {
-                                        log.debug("Storing transaction with consensus timestamp {}", () -> Utility
-                                                .printProtoMessage(txRecord.getConsensusTimestamp()));
-                                    }
-
-                                    RecordFileLogger.storeRecord(transaction, txRecord, rawBytes);
-                                } finally {
-                                    // TODO: Refactor to not parse TransactionBody twice
-                                    DataCase dc = Utility.getTransactionBody(transaction).getDataCase();
-                                    String type = dc != null && dc != DataCase.DATA_NOT_SET ? dc.name() : "UNKNOWN";
-                                    transactionSizeMetric.tag("type", type)
-                                            .register(meterRegistry)
-                                            .record(rawBytes.length);
-
-                                    Instant consensusTimestamp = Utility
-                                            .convertToInstant(txRecord.getConsensusTimestamp());
-                                    transactionLatencyMetric.tag("type", type)
-                                            .register(meterRegistry)
-                                            .record(Duration.between(consensusTimestamp, Instant.now()));
-                                }
-                                break;
-                            case FileDelimiter.RECORD_TYPE_SIGNATURE:
-                                int sigLength = dis.readInt();
-                                byte[] sigBytes = new byte[sigLength];
-                                dis.readFully(sigBytes);
-                                log.trace("File {} has signature {}", fileName, Hex.encodeHexString(sigBytes));
-                                break;
-
-                            default:
-                                log.error("Unknown record file delimiter {} for file {}", typeDelimiter, file);
-                                RecordFileLogger.rollback();
-                                return false;
-                        }
-                    } catch (Exception e) {
-                        log.error("Exception {}", e);
-                        RecordFileLogger.rollback();
-                        return false;
+                        default:
+                            log.error("Unknown record file delimiter {} for file {}", typeDelimiter, fileName);
+                            rollback();
+                            return false;
                     }
+                } catch (Exception e) {
+                    log.error("Exception {}", e);
+                    rollback();
+                    return false;
                 }
-
-                log.trace("Calculated file hash for the current file {}", thisFileHash);
-                RecordFileLogger.completeFile(thisFileHash, previousFileHash);
-
-                if (!Utility.hashIsEmpty(thisFileHash)) {
-                    applicationStatusRepository
-                            .updateStatusValue(ApplicationStatusCode.LAST_PROCESSED_RECORD_HASH, thisFileHash);
-                }
-
-                success = true;
-            } catch (Exception e) {
-                log.error("Error parsing record file {} after {}", file, stopwatch, e);
-                RecordFileLogger.rollback();
-            } finally {
-                log.info("Finished parsing {} transactions from record file {} in {}", counter, file
-                        .getName(), stopwatch);
-
-                parseDurationMetric.tag("type", "record")
-                        .tag("success", success.toString())
-                        .tag("version", recordFileVersion.toString())
-                        .register(meterRegistry)
-                        .record(stopwatch.elapsed());
             }
 
-            return success;
-        } else if (initFileResult == RecordFileLogger.INIT_RESULT.SKIP) {
-            return true;
-        } else {
-            RecordFileLogger.rollback();
-            return false;
+            log.trace("Calculated file hash for the current file {}", thisFileHash);
+            closeFileAndCommit(thisFileHash, expectedPrevFileHash);
+
+            if (!Utility.hashIsEmpty(thisFileHash)) {
+                applicationStatusRepository
+                        .updateStatusValue(ApplicationStatusCode.LAST_PROCESSED_RECORD_HASH, thisFileHash);
+            }
+            success = true;
+        } catch (Exception e) {
+            log.error("Error parsing record file {} after {}", fileName, stopwatch, e);
+            rollback();
+        } finally {
+            log.info("Finished parsing {} transactions from record file {} in {}", counter, fileName, stopwatch);
+
+            parseDurationMetric.tag("type", "record")
+                    .tag("success", success.toString())
+                    .tag("version", recordFileVersion.toString())
+                    .register(meterRegistry)
+                    .record(stopwatch.elapsed());
         }
+        return success;
     }
 
     /**
@@ -277,18 +285,24 @@ public class RecordFileParser implements FileParser {
      *
      * @throws Exception
      */
-    private void loadRecordFiles(List<String> fileNames) throws Exception {
+    private void loadRecordFiles(List<String> fileNames) {
         String prevFileHash = applicationStatusRepository
                 .findByStatusCode(ApplicationStatusCode.LAST_PROCESSED_RECORD_HASH);
         Collections.sort(fileNames);
 
         for (String name : fileNames) {
-            String thisFileHash = "";
             if (ShutdownHelper.isStopping()) {
                 return;
             }
-            thisFileHash = Hex.encodeHexString(Utility.getFileHash(name));
-            if (loadRecordFile(name, prevFileHash, thisFileHash)) {
+            String thisFileHash = Hex.encodeHexString(Utility.getFileHash(name));
+            InputStream fileInputStream;
+            try {
+                fileInputStream = new FileInputStream(new File(name));
+            } catch (FileNotFoundException e) {
+                log.warn("File does not exist {}", name);
+                return;
+            }
+            if (loadRecordFile(name, fileInputStream, prevFileHash, thisFileHash)) {
                 prevFileHash = thisFileHash;
                 Utility.moveFileToParsedDir(name, "/parsedRecordFiles/");
             } else {
@@ -311,7 +325,7 @@ public class RecordFileParser implements FileParser {
 
             Path path = parserProperties.getValidPath();
             log.debug("Parsing record files from {}", path);
-            if (RecordFileLogger.start()) {
+            if (recordItemParser.start()) {
 
                 File file = path.toFile();
                 if (file.isDirectory()) { //if it's a directory
@@ -334,7 +348,7 @@ public class RecordFileParser implements FileParser {
                 } else {
                     log.error("Input parameter is not a folder: {}", path);
                 }
-                RecordFileLogger.finish();
+                recordItemParser.finish();
             }
         } catch (Exception e) {
             log.error("Error parsing files", e);

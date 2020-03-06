@@ -52,11 +52,15 @@ public class RecordParserProperties implements ParserProperties {
 
     private boolean persistFiles = true;
 
+    private boolean persistNonFeeTransfers = false;
+
     private boolean persistSystemFiles = true;
 
     // If configured the mirror node will store the raw transaction
     // bytes on the t_transaction table
     private boolean persistTransactionBytes = false;
+
+    private final PostgresWriterProperties postgresWriter;
 
     @Override
     public Path getStreamPath() {

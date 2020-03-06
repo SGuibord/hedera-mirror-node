@@ -133,19 +133,15 @@ public class TopicMessageRepositoryTest extends GrpcIntegrationTest {
     }
 
     @Test
-    void findByConsensusTimestampGreaterThan() {
+    void findLatest() {
         TopicMessage topicMessage1 = domainBuilder.topicMessage().block();
         TopicMessage topicMessage2 = domainBuilder.topicMessage().block();
         TopicMessage topicMessage3 = domainBuilder.topicMessage().block();
-        Pageable pageable = PageRequest.of(0, 4);
+        TopicMessage topicMessage4 = domainBuilder.topicMessage().block();
+        Pageable pageable = PageRequest.of(0, 2);
 
         assertThat(topicMessageRepository
-                .findByConsensusTimestampGreaterThan(topicMessage1.getConsensusTimestamp(), pageable))
+                .findLatest(topicMessage1.getConsensusTimestamp(), pageable))
                 .containsExactly(topicMessage2, topicMessage3);
-
-        pageable = PageRequest.of(0, 1);
-        assertThat(topicMessageRepository
-                .findByConsensusTimestampGreaterThan(topicMessage1.getConsensusTimestamp(), pageable))
-                .containsExactly(topicMessage2);
     }
 }

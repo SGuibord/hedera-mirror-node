@@ -23,6 +23,7 @@ package com.hedera.mirror.grpc.listener;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Stream;
 import javax.inject.Named;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -33,19 +34,17 @@ import reactor.core.scheduler.Schedulers;
 import reactor.retry.Jitter;
 import reactor.retry.Repeat;
 
-import com.hedera.mirror.grpc.GrpcProperties;
 import com.hedera.mirror.grpc.domain.TopicMessage;
 import com.hedera.mirror.grpc.domain.TopicMessageFilter;
-import com.hedera.mirror.grpc.retriever.TopicMessageRetriever;
+import com.hedera.mirror.grpc.repository.TopicMessageRepository;
 
 @Named
 @Log4j2
 @RequiredArgsConstructor
 public class PollingTopicListener implements TopicListener {
 
-    private final GrpcProperties grpcProperties;
     private final ListenerProperties listenerProperties;
-    private final TopicMessageRetriever topicMessageRetriever;
+    private final TopicMessageRepository topicMessageRepository;
     private final Scheduler scheduler = Schedulers
             .newParallel("poll", 4 * Runtime.getRuntime().availableProcessors(), true);
 
@@ -54,10 +53,10 @@ public class PollingTopicListener implements TopicListener {
         PollingContext context = new PollingContext(filter);
         Duration frequency = listenerProperties.getPollingFrequency();
 
-        return Flux.defer(() -> poll(context))
-                .delaySubscription(Duration.ofMillis(frequency.toMillis()), scheduler)
+        return Flux.fromStream(() -> poll(context))
+                .delaySubscription(frequency, scheduler)
                 .repeatWhen(Repeat.times(Long.MAX_VALUE)
-                        .fixedBackoff(Duration.ofMillis(frequency.toMillis()))
+                        .fixedBackoff(frequency)
                         .jitter(Jitter.random(0.1))
                         .withBackoffScheduler(scheduler))
                 .name("poll")
@@ -66,22 +65,19 @@ public class PollingTopicListener implements TopicListener {
                 .doOnSubscribe(s -> log.info("Starting to poll every {}ms: {}", frequency.toMillis(), filter));
     }
 
-    private Flux<TopicMessage> poll(PollingContext context) {
+    private Stream<TopicMessage> poll(PollingContext context) {
         TopicMessageFilter filter = context.getFilter();
         TopicMessage last = context.getLast();
-        long limit = filter.hasLimit() ? filter.getLimit() - context.getCount().get() : 0;
+        int limit = filter.hasLimit() ? (int) (filter.getLimit() - context.getCount().get()) : Integer.MAX_VALUE;
+        int pageSize = Math.min(limit, listenerProperties.getMaxPageSize());
         Instant startTime = last != null ? last.getConsensusTimestampInstant().plusNanos(1) : filter.getStartTime();
 
-        TopicMessageFilter newFilter = TopicMessageFilter.builder()
-                .endTime(filter.getEndTime())
-                .limit(limit)
-                .realmNum(filter.getRealmNum())
-                .subscriberId(filter.getSubscriberId())
+        TopicMessageFilter newFilter = filter.toBuilder()
+                .limit(pageSize)
                 .startTime(startTime)
-                .topicNum(filter.getTopicNum())
                 .build();
 
-        return topicMessageRetriever.retrieve(newFilter);
+        return topicMessageRepository.findByFilter(newFilter);
     }
 
     @Data

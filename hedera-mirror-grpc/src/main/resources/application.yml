@@ -10,13 +10,12 @@ hedera:
       port: 5600
 grpc:
   server:
-    max-inbound-message-size: 6144
     port: ${hedera.mirror.grpc.port}
 logging:
   level:
     root: warn
-    com.hedera.mirror.grpc: trace
-    org.hibernate.SQL: debug
+    com.hedera.mirror.grpc: info
+    # org.hibernate.SQL: debug
     # org.hibernate.type.descriptor.sql.BasicBinder: trace
 management:
   metrics:

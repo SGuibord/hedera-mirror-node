@@ -11,7 +11,7 @@
     <parent>
         <groupId>com.hedera</groupId>
         <artifactId>hedera-mirror-node</artifactId>
-        <version>0.5.5</version>
+        <version>0.6.0</version>
     </parent>
 
     <dependencies>
@@ -149,6 +149,12 @@
             <version>5.1.1</version>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>com.hedera.hashgraph</groupId>
+            <artifactId>sdk</artifactId>
+            <version>1.1.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -200,12 +206,4 @@
             </plugin>
         </plugins>
     </build>
-
-    <repositories>
-        <repository>
-            <id>spring-libs-snapshot</id>
-            <name>SpringSnapshotRepository</name>
-            <url>https://repo.spring.io/libs-snapshot</url>
-        </repository>
-    </repositories>
 </project>

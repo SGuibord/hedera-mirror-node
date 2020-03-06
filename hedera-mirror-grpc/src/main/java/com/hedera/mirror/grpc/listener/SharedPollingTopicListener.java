@@ -21,7 +21,6 @@ package com.hedera.mirror.grpc.listener;
  */
 
 import com.google.common.base.Stopwatch;
-import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -29,15 +28,16 @@ import javax.inject.Named;
 import lombok.Data;
 import lombok.extern.log4j.Log4j2;
 import org.reactivestreams.Subscription;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import reactor.core.Disposable;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
-import reactor.retry.Jitter;
 import reactor.retry.Repeat;
 
-import com.hedera.mirror.grpc.GrpcProperties;
 import com.hedera.mirror.grpc.converter.InstantToLongConverter;
 import com.hedera.mirror.grpc.domain.TopicMessage;
 import com.hedera.mirror.grpc.domain.TopicMessageFilter;
@@ -47,55 +47,69 @@ import com.hedera.mirror.grpc.repository.TopicMessageRepository;
 @Log4j2
 public class SharedPollingTopicListener implements TopicListener {
 
-    private final GrpcProperties grpcProperties;
+    private final ListenerProperties listenerProperties;
     private final TopicMessageRepository topicMessageRepository;
     private final InstantToLongConverter instantToLongConverter;
-    private final Flux<TopicMessage> poller;
+    private final Scheduler scheduler;
 
-    public SharedPollingTopicListener(GrpcProperties grpcProperties, ListenerProperties listenerProperties,
+    private Flux<TopicMessage> poller = Flux.empty();
+    private Disposable pollerDisposable;
+
+    public SharedPollingTopicListener(ListenerProperties listenerProperties,
                                       TopicMessageRepository topicMessageRepository,
                                       InstantToLongConverter instantToLongConverter) {
-        this.grpcProperties = grpcProperties;
+        this.listenerProperties = listenerProperties;
         this.topicMessageRepository = topicMessageRepository;
         this.instantToLongConverter = instantToLongConverter;
+        scheduler = Schedulers.newSingle("shared-poll", true);
+    }
 
-        Duration frequency = listenerProperties.getPollingFrequency();
+    /*
+     * Subscribe on startup and ignore messages to start backfilling the buffer. This method is also used by tests to
+     * reset the buffer between runs. Outside these two use cases this method should not be used.
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public void init() {
         PollingContext context = new PollingContext();
         Scheduler scheduler = Schedulers.newSingle("shared-poll", true);
 
+        if (pollerDisposable != null) {
+            pollerDisposable.dispose();
+        }
+
         poller = Flux.defer(() -> poll(context))
                 .repeatWhen(Repeat.times(Long.MAX_VALUE)
-                        .fixedBackoff(Duration.ofMillis(frequency.toMillis()))
-                        .jitter(Jitter.random(0.1))
+                        .fixedBackoff(listenerProperties.getPollingFrequency())
                         .withBackoffScheduler(scheduler))
                 .name("shared-poll")
                 .metrics()
-                .doOnNext(context::onNext)
-                .doOnSubscribe(s -> log.info("Starting to poll every {}ms", frequency.toMillis()))
-                .doOnComplete(() -> log.info("Completed polling"))
                 .doOnCancel(() -> log.info("Cancelled polling"))
-                .share();
+                .doOnComplete(() -> log.info("Completed polling"))
+                .doOnNext(context::onNext)
+                .doOnSubscribe(context::onStart)
+                .replay(listenerProperties.getBufferSize())
+                .autoConnect(1, disposable -> pollerDisposable = disposable);
+
+        poller.subscribe(t -> {}, e -> {});
     }
 
     @Override
     public Flux<TopicMessage> listen(TopicMessageFilter filter) {
         return poller.filter(t -> filterMessage(t, filter))
-                .doOnSubscribe(s -> log.info("Listening for messages: {}", filter));
+                .doOnSubscribe(s -> log.info("Subscribing: {}", filter));
     }
 
     private Flux<TopicMessage> poll(PollingContext context) {
         Instant instant = context.getLastConsensusTimestamp();
         Long consensusTimestamp = instantToLongConverter.convert(instant);
-        Pageable pageable = PageRequest.of(0, grpcProperties.getMaxPageSize());
-        log.debug("Querying for messages after: {}", instant);
+        Pageable pageable = PageRequest.of(0, listenerProperties.getMaxPageSize());
 
-        return Flux.defer(() -> Flux
-                .fromIterable(topicMessageRepository.findByConsensusTimestampGreaterThan(consensusTimestamp, pageable)))
-                .name("findByConsensusTimestampGreaterThan")
+        return Flux.defer(() -> Flux.fromIterable(topicMessageRepository.findLatest(consensusTimestamp, pageable)))
+                .name("findLatest")
                 .metrics()
-                .doOnCancel(context::onComplete)
-                .doOnComplete(context::onComplete)
-                .doOnSubscribe(context::onSubscribe);
+                .doOnCancel(context::onPollEnd)
+                .doOnComplete(context::onPollEnd)
+                .doOnSubscribe(context::onPollStart);
     }
 
     private boolean filterMessage(TopicMessage message, TopicMessageFilter filter) {
@@ -107,24 +121,32 @@ public class SharedPollingTopicListener implements TopicListener {
     @Data
     private class PollingContext {
 
-        private final AtomicLong count = new AtomicLong();
+        private final AtomicLong count = new AtomicLong(0L);
         private final Stopwatch stopwatch = Stopwatch.createUnstarted();
-        private volatile Instant lastConsensusTimestamp = Instant.now();
+        private volatile Instant lastConsensusTimestamp = Instant.now().minus(listenerProperties.getBufferInitial());
 
         void onNext(TopicMessage topicMessage) {
+            count.incrementAndGet();
             lastConsensusTimestamp = topicMessage.getConsensusTimestampInstant();
+            log.trace("Next message: {}", topicMessage);
         }
 
-        void onSubscribe(Subscription subscription) {
-            count.set(0L);
-            stopwatch.reset().start();
-            log.debug("Executing query for messages after timestamp {}", lastConsensusTimestamp);
-        }
-
-        void onComplete() {
+        void onPollEnd() {
             var elapsed = stopwatch.elapsed(TimeUnit.MILLISECONDS);
             var rate = elapsed > 0 ? (int) (1000.0 * count.get() / elapsed) : 0;
             log.debug("Finished querying with {} messages in {} ({}/s)", count, stopwatch, rate);
+        }
+
+        void onPollStart(Subscription subscription) {
+            count.set(0L);
+            stopwatch.reset().start();
+            log.debug("Querying for messages after timestamp {}", lastConsensusTimestamp);
+        }
+
+        // Backfill the buffer on startup
+        void onStart(Subscription subscription) {
+            lastConsensusTimestamp = Instant.now().minus(listenerProperties.getBufferInitial());
+            log.info("Starting to poll every {}ms", listenerProperties.getPollingFrequency().toMillis());
         }
     }
 }

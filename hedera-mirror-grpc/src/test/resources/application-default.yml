@@ -13,7 +13,10 @@ hedera:
         name: mirror_node_test
         password: mirror_node_pass
         username: mirror_node
+      endTimeInterval: 100ms
       listener:
+        pollingFrequency: 50ms
+      retriever:
         pollingFrequency: 50ms
 spring:
   datasource:

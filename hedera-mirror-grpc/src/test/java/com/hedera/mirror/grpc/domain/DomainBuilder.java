@@ -35,6 +35,7 @@ import org.springframework.context.annotation.Scope;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import com.hedera.mirror.grpc.repository.EntityRepository;
 import com.hedera.mirror.grpc.repository.TopicMessageRepository;
 
 @Log4j2
@@ -44,12 +45,31 @@ import com.hedera.mirror.grpc.repository.TopicMessageRepository;
 public class DomainBuilder {
 
     private final Instant now = Instant.now();
+    private final EntityRepository entityRepository;
     private final TopicMessageRepository topicMessageRepository;
     private long sequenceNumber = 0L;
 
     @PostConstruct
     void setup() {
+        entityRepository.deleteAll();
         topicMessageRepository.deleteAll();
+    }
+
+    public Mono<Entity> entity() {
+        return entity(e -> {
+        });
+    }
+
+    public Mono<Entity> entity(Consumer<Entity.EntityBuilder> customizer) {
+        Entity.EntityBuilder builder = Entity.builder()
+                .entityNum(0L)
+                .entityRealm(0L)
+                .entityShard(0L)
+                .entityTypeId(EntityType.TOPIC);
+
+        customizer.accept(builder);
+        Entity entity = builder.build();
+        return insert(entity).thenReturn(entity);
     }
 
     public Mono<TopicMessage> topicMessage() {
@@ -84,6 +104,11 @@ public class DomainBuilder {
             publishers.add(topicMessage());
         }
         return Flux.concat(publishers);
+    }
+
+    private Mono<Entity> insert(Entity entity) {
+        return Mono.defer(() -> Mono.just(entityRepository.save(entity)))
+                .doOnNext(t -> log.debug("Inserted: {}", t));
     }
 
     private Mono<TopicMessage> insert(TopicMessage topicMessage) {
